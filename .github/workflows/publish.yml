@@ -1,0 +1,76 @@
+name: "Publish"
+
+on:
+  workflow_call:
+
+jobs:
+  build_wheels:
+    name: Build wheels on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v3.3.1
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: cibw-wheels-${{ matrix.os }}-${{ strategy.job-index }}
+          path: ./wheelhouse/*.whl
+
+  build_sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        version: "0.9.28"
+        enable-cache: true
+        python-version: "3.13"
+
+    - name: Build sdist
+      run: uv build --sdist
+
+    - uses: actions/upload-artifact@v6
+      with:
+        name: cibw-sdist
+        path: dist/*.tar.gz
+
+    - name: smoke test sdist
+      run: uv run --isolated --no-project --with dist/*.tar.gz smoke_test.py
+
+
+  publish:
+    name: Publish to PyPI
+    needs: [build_wheels, build_sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+    - name: Download wheel artifacts
+      uses: actions/download-artifact@v7
+      with:
+        pattern: cibw-*
+        path: dist
+        merge-multiple: true
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        version: "0.9.28"
+        python-version: "3.13"
+
+    - name: Publish to PyPI
+      run: uv publish

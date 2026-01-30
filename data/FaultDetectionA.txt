@@ -1,0 +1,27 @@
+FaultDetectionA and FaultDetectionB are subsets taken from the FaultDetection dataset [1], https://mb.uni-paderborn.de/en/kat/main-research/datacenter/bearing-datacenter/data-sets-and-download,
+ which is gathered from an electromechanical drive system that monitors the condition of
+rolling bearings and detect damages in them. There are four subsets of
+data collected under various conditions, whose parameters include
+rotational speed, load torque, and radial force. 
+
+FaultDetectionA has three classes, the distribution of which is unbalanced, but identical in the train and test sets.
+
+[0.09090909 0.45454545 0.45454545]
+<ol>
+<li> undamaged (9.09%)
+<li> inner damaged (45.55%)
+<li> outer damaged (45.55%)
+</ol>
+
+Each original recording has a single channel with sampling frequency of 64k Hz and lasts 4 seconds. The data we host was processed with a sliding window in [2] to produce more cases. 
+The data were split in [1] into 8184 train cases, 2728 validation and 2728 test. We have added the validation set to the end of the train file to ease reproduction if a validation set is needed. 
+We are not aware of whether the original recordings were separated in the train and test.
+
+
+
+[1] Christian Lessmeier, James Kuria Kimotho, Detmar Zimmer, and Walter Sextro. Condition
+monitoring of bearing damage in electromechanical drive systems by using motor current signals
+of electric motors: A benchmark data set for data-driven classification. In PHM Society European
+Conference, volume 3, 2016.
+[2] Zhang et al. Self-Supervised Contrastive Pre-Training For Time Series via Time-Frequency Consistency, NeurIPS 2022.
+

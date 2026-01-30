@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools", "wheel", "numpy", "cython"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fpcs"
+authors = [
+    { name = "Thomas Michelat", email = "thomas.michelat@gmail.com" },
+]
+description = "Feature-Preserving Compensated Sampling for time series downsampling"
+dynamic = ["version", "readme"]
+license = "MIT"
+keywords = ["downsampling", "time series", "visualization", "data science"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Cython",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+]
+
+[project.urls]
+Homepage = "https://github.com/tmichela/fpcs"
+Repository = "https://github.com/tmichela/fpcs"
+
+[project.optional-dependencies]
+dev = [
+    "cython",
+    "matplotlib",
+    "lttbc",
+    "pytest",
+    "pytest-benchmark",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["fpcs"]
+
+[tool.setuptools.dynamic]
+version = { attr = "fpcs.__version__" }
+readme = { file = ["README.md"], content-type = "text/markdown" }
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

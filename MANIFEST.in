@@ -1,0 +1,6 @@
+include README.md LICENCE pyproject.toml setup.py
+recursive-include src/fpcs *.py *.pyx
+global-exclude *.so *.o *.a *.pyc __pycache__ .DS_Store
+prune build
+prune data
+prune figures
