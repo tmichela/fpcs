@@ -8,7 +8,7 @@ This module provides two interfaces for the FPCS algorithm:
 
 from dataclasses import dataclass
 from typing import Iterator
-import math
+from math import isnan
 import numpy as np
 from numpy.typing import ArrayLike
 
@@ -30,8 +30,9 @@ class FPCSDownsampler:
     Parameters
     ----------
     ratio : int
-        The sampling ratio R. Must be >= 1. For every R points received,
-        approximately 1-2 points will be retained.
+        The window size R, counting all samples including NaNs. Must be >= 1.
+        Mixed windows ignore NaNs; all-NaN windows retain one gap marker.
+        Output is bounded by min(n, 2 * ceil(n / R) + 2), including endpoints.
 
     Example
     -------
@@ -53,13 +54,29 @@ class FPCSDownsampler:
 
     def _reset(self):
         """Reset the internal state."""
+        self._index: int = -1
+        self._last_retained_index: int = -1
+        self._last_point: Point | None = None
+        self._clear_window_state()
+
+    def _clear_window_state(self):
+        """Clear extrema and compensation after a missing window or flush."""
         self._potential_point: Point | None = None
+        self._potential_index: int = -1
         self._previous_min_flag: int = -1  # -1: no data, 0: retained max, 1: retained min
         self._counter: int = 0
         self._max_point: Point | None = None
+        self._max_index: int = -1
         self._min_point: Point | None = None
-        self._initialized: bool = False
-        self._pending_nans: list[Point] = []  # NaN points to yield before next retained point
+        self._min_index: int = -1
+        self._window_start_point: Point | None = None
+        self._window_has_valid: bool = False
+
+    def _retain(self, index: int, point: Point) -> Iterator[tuple[float, float]]:
+        """Yield each source point at most once, in input order."""
+        if index > self._last_retained_index:
+            self._last_retained_index = index
+            yield (point.x, point.y)
 
     def add(self, x: float, y: float) -> Iterator[tuple[float, float]]:
         """
@@ -70,42 +87,40 @@ class FPCSDownsampler:
         x : float
             The x-coordinate (typically time/index).
         y : float
-            The y-coordinate (the value). NaN values are always retained.
-            ±Inf values are treated as extrema.
+            The y-coordinate (the value). NaNs count toward window length but
+            are ignored for extrema. All-NaN windows retain a gap marker.
+            ±Inf values are extrema. With ratio=1, every point is retained.
 
         Yields
         ------
         tuple[float, float]
             Retained points as (x, y) tuples.
         """
+        index = self._index + 1
+        self._index = index
+        if self.ratio == 1:
+            yield (x, y)
+            return
+
         p = Point(x, y)
-
-        # Handle NaN: always retain NaN points (to preserve data gaps)
-        # but don't use them for min/max comparison
-        if math.isnan(y):
-            self._pending_nans.append(p)
-            self._counter += 1
-            # Check if we've reached the sampling threshold
-            if self._counter >= self.ratio:
-                yield from self._process_window()
-            return
-
-        # First point initialization (skip NaN for initialization)
-        if not self._initialized:
-            self._max_point = p
-            self._min_point = p
-            self._counter = 1
-            self._initialized = True
-            return
-
+        if self._last_point is None:
+            yield from self._retain(index, p)
+        self._last_point = p
+        if self._counter == 0:
+            self._window_start_point = p
         self._counter += 1
 
-        # Update max/min points (Inf values are valid extrema)
-        # Note: comparisons with Inf work correctly in Python
-        if p.y >= self._max_point.y:
-            self._max_point = p
-        elif p.y < self._min_point.y:
-            self._min_point = p
+        if not isnan(y):
+            self._window_has_valid = True
+            if self._max_point is None:
+                self._max_point = self._min_point = p
+                self._max_index = self._min_index = index
+            elif p.y >= self._max_point.y:
+                self._max_point = p
+                self._max_index = index
+            elif p.y < self._min_point.y:
+                self._min_point = p
+                self._min_index = index
 
         # Check if we've reached the sampling threshold
         if self._counter >= self.ratio:
@@ -113,69 +128,59 @@ class FPCSDownsampler:
 
     def _process_window(self) -> Iterator[tuple[float, float]]:
         """Process the current window and yield retained points."""
-        # Yield any pending NaN points first (in order)
-        for nan_point in self._pending_nans:
-            yield (nan_point.x, nan_point.y)
-        self._pending_nans.clear()
-
-        # Handle case where we only had NaN points (no valid min/max)
-        if not self._initialized:
-            self._counter = 0
+        if not self._window_has_valid:
+            if self._potential_point is not None:
+                yield from self._retain(self._potential_index, self._potential_point)
+            yield from self._retain(
+                self._index - self._counter + 1, self._window_start_point,
+            )
+            self._clear_window_state()
             return
 
-        if self._min_point.x < self._max_point.x:
-            # MinPoint received before MaxPoint
-            if (self._previous_min_flag == 1 and 
-                self._potential_point is not None and
-                self._min_point != self._potential_point):
-                # Compensation: both adjacent samplings retain MinPoint
-                yield (self._potential_point.x, self._potential_point.y)
-
-            # Retain MinPoint
-            yield (self._min_point.x, self._min_point.y)
-
-            # Update state
+        if self._min_index < self._max_index:
+            if self._previous_min_flag == 1 and self._potential_point is not None:
+                yield from self._retain(self._potential_index, self._potential_point)
+            yield from self._retain(self._min_index, self._min_point)
             self._potential_point = self._max_point
+            self._potential_index = self._max_index
             self._min_point = self._max_point
+            self._min_index = self._max_index
             self._previous_min_flag = 1
         else:
-            # MaxPoint received before MinPoint (or same position)
-            if (self._previous_min_flag == 0 and
-                self._potential_point is not None and
-                self._max_point != self._potential_point):
-                # Compensation: both adjacent samplings retain MaxPoint
-                yield (self._potential_point.x, self._potential_point.y)
-
-            # Retain MaxPoint
-            yield (self._max_point.x, self._max_point.y)
-
-            # Update state
+            if self._previous_min_flag == 0 and self._potential_point is not None:
+                yield from self._retain(self._potential_index, self._potential_point)
+            yield from self._retain(self._max_index, self._max_point)
             self._potential_point = self._min_point
+            self._potential_index = self._min_index
             self._max_point = self._min_point
+            self._max_index = self._min_index
             self._previous_min_flag = 0
 
         self._counter = 0
+        self._window_has_valid = False
+        self._window_start_point = None
 
     def flush(self) -> Iterator[tuple[float, float]]:
         """
-        Flush any remaining points from an incomplete window.
+        Finish the partial window, pending extremum, and global endpoint.
 
-        Call this after all data has been processed to ensure no points
-        are left in the buffer.
+        Call this at the end of the stream to retain pending extrema and the
+        last endpoint. Repeated calls yield nothing until new points are added.
 
         Yields
         ------
         tuple[float, float]
             Any remaining retained points as (x, y) tuples.
         """
-        # Yield any pending NaN points
-        for nan_point in self._pending_nans:
-            yield (nan_point.x, nan_point.y)
-        self._pending_nans.clear()
-
-        if self._counter > 0 and self._initialized:
-            # Process the incomplete final window
+        if self._last_point is None:
+            return
+        if self._counter > 0:
             yield from self._process_window()
+        if self._potential_point is not None:
+            yield from self._retain(self._potential_index, self._potential_point)
+        yield from self._retain(self._index, self._last_point)
+        self._clear_window_state()
+        self._last_point = None
 
     def reset(self):
         """Reset the downsampler to its initial state."""
@@ -190,8 +195,10 @@ def downsample(
     """
     Downsample a time series using the FPCS algorithm.
 
-    The first and last data points are always retained. This ensures the output
-    spans the same domain as the input.
+    Fixed windows count all input samples. Mixed windows ignore NaNs when
+    selecting extrema; all-NaN windows retain one gap marker and reset
+    compensation. Global endpoints are retained, even if NaN. With ratio=1,
+    all points are retained.
 
     Parameters
     ----------
@@ -200,8 +207,8 @@ def downsample(
     y : array-like
         The y-coordinates (e.g., values).
     ratio : int
-        The sampling ratio R. Must be >= 1. For every R points,
-        approximately 1-2 points will be retained.
+        The window size R, including NaNs. Must be >= 1. Output is bounded by
+        min(n, 2 * ceil(n / R) + 2), including global endpoints.
 
     Returns
     -------
@@ -237,10 +244,6 @@ def downsample(
     if ratio == 1:
         return x.copy(), y.copy()
 
-    # Store first and last points
-    first_x, first_y = x[0], y[0]
-    last_x, last_y = x[-1], y[-1]
-
     downsampler = FPCSDownsampler(ratio)
 
     retained_x = []
@@ -255,16 +258,6 @@ def downsample(
     for rx, ry in downsampler.flush():
         retained_x.append(rx)
         retained_y.append(ry)
-
-    # Ensure first point is included
-    if len(retained_x) == 0 or retained_x[0] != first_x:
-        retained_x.insert(0, first_x)
-        retained_y.insert(0, first_y)
-
-    # Ensure last point is included
-    if retained_x[-1] != last_x:
-        retained_x.append(last_x)
-        retained_y.append(last_y)
 
     return np.array(retained_x), np.array(retained_y)
 

@@ -22,7 +22,7 @@ Optimizations applied:
 
 cimport cython
 from libc.stdlib cimport malloc, free
-from libc.string cimport memcpy, memmove
+from libc.string cimport memcpy
 from libc.math cimport isnan
 from cpython.mem cimport PyMem_Malloc, PyMem_Free
 import numpy as np
@@ -57,21 +57,9 @@ cdef tuple _downsample_float64(
     if ratio == 1:
         return np.asarray(x).copy(), np.asarray(y).copy()
 
-    # Store first and last points
-    cdef double first_x = x[0]
-    cdef double first_y = y[0]
-    cdef double last_x = x[n - 1]
-    cdef double last_y = y[n - 1]
-
-    # Maximum possible output size: 
-    # - All NaN values are retained (worst case: n NaN points)
-    # - Plus 2 points per window for non-NaN extrema
-    # - Plus 2 for first/last point retention
-    cdef Py_ssize_t max_output = n + ((n + ratio - 1) // ratio) * 2 + 4
-
-    # Allocate output buffers using C malloc for performance
-    cdef double* out_x = <double*>malloc(max_output * sizeof(double))
-    cdef double* out_y = <double*>malloc(max_output * sizeof(double))
+    cdef Py_ssize_t capacity = _output_capacity(n, ratio)
+    cdef double* out_x = <double*>malloc(capacity * sizeof(double))
+    cdef double* out_y = <double*>malloc(capacity * sizeof(double))
 
     if out_x == NULL or out_y == NULL:
         if out_x != NULL:
@@ -81,41 +69,21 @@ cdef tuple _downsample_float64(
         raise MemoryError("Failed to allocate output buffers")
 
     cdef Py_ssize_t out_count
-    cdef Py_ssize_t final_count
-    cdef Py_ssize_t i
     cdef const double* x_ptr = &x[0]
     cdef const double* y_ptr = &y[0]
+    cdef np.ndarray[double, ndim=1, mode='c'] result_x, result_y
 
-    # Run the core algorithm without GIL
-    with nogil:
-        out_count = _downsample_core_ptr(x_ptr, y_ptr, n, ratio, out_x, out_y)
+    try:
+        with nogil:
+            out_count = _downsample_core_ptr(x_ptr, y_ptr, n, ratio, out_x, out_y)
 
-        # Ensure first point is included
-        final_count = out_count
-        if out_count == 0 or out_x[0] != first_x:
-            # Use memmove for efficient bulk shift (handles overlapping memory)
-            memmove(&out_x[1], &out_x[0], out_count * sizeof(double))
-            memmove(&out_y[1], &out_y[0], out_count * sizeof(double))
-            out_x[0] = first_x
-            out_y[0] = first_y
-            final_count += 1
-
-        # Ensure last point is included (always O(1) - just append)
-        if out_x[final_count - 1] != last_x:
-            out_x[final_count] = last_x
-            out_y[final_count] = last_y
-            final_count += 1
-
-    # Create output arrays and copy data
-    cdef np.ndarray[double, ndim=1, mode='c'] result_x = np.empty(final_count, dtype=np.float64)
-    cdef np.ndarray[double, ndim=1, mode='c'] result_y = np.empty(final_count, dtype=np.float64)
-
-    # Use memcpy for fast bulk copy
-    memcpy(<void*>result_x.data, <void*>out_x, final_count * sizeof(double))
-    memcpy(<void*>result_y.data, <void*>out_y, final_count * sizeof(double))
-
-    free(out_x)
-    free(out_y)
+        result_x = np.empty(out_count, dtype=np.float64)
+        result_y = np.empty(out_count, dtype=np.float64)
+        memcpy(<void*>result_x.data, <void*>out_x, out_count * sizeof(double))
+        memcpy(<void*>result_y.data, <void*>out_y, out_count * sizeof(double))
+    finally:
+        free(out_x)
+        free(out_y)
 
     return result_x, result_y
 
@@ -128,8 +96,10 @@ def downsample(
     """
     Downsample a time series using the FPCS algorithm (Cython implementation).
 
-    The first and last data points are always retained. This ensures the output
-    spans the same domain as the input.
+    Fixed windows count all input samples. Mixed windows ignore NaNs when
+    selecting extrema; all-NaN windows retain one gap marker and reset
+    compensation. Global endpoints are retained, even if NaN. With ratio=1,
+    all points are retained.
 
     Parameters
     ----------
@@ -138,8 +108,8 @@ def downsample(
     y : array-like
         The y-coordinates (e.g., values). Integer inputs are supported.
     ratio : int
-        The sampling ratio R. Must be >= 1. For every R points,
-        approximately 1-2 points will be retained.
+        The window size R, including NaNs. Must be >= 1. Output is bounded by
+        min(n, 2 * ceil(n / R) + 2), including global endpoints.
 
     Returns
     -------
@@ -156,48 +126,42 @@ def downsample(
     return _downsample_float64(x_view, y_view, ratio)
 
 
-cdef inline void _process_window_state(
-    double min_x, double min_y,
-    double max_x, double max_y,
-    double potential_x, double potential_y,
-    int* previous_min_flag,
-    bint* has_potential,
+cdef inline void _retain_index(
+    const double* x, const double* y,
+    Py_ssize_t index,
     double* out_x, double* out_y,
-    Py_ssize_t* out_idx
+    Py_ssize_t* out_idx, Py_ssize_t* last_retained,
 ) noexcept nogil:
-    """Inline helper to process a completed window and write retained points."""
-    # Process window based on temporal order of extrema
-    if min_x < max_x:
-        # Min came before Max - retain Min
-        if previous_min_flag[0] == 1 and has_potential[0]:
-            if min_x != potential_x or min_y != potential_y:
-                out_x[out_idx[0]] = potential_x
-                out_y[out_idx[0]] = potential_y
-                out_idx[0] += 1
-
-        out_x[out_idx[0]] = min_x
-        out_y[out_idx[0]] = min_y
+    """Retain each source sample at most once, in input order."""
+    if index > last_retained[0]:
+        out_x[out_idx[0]] = x[index]
+        out_y[out_idx[0]] = y[index]
         out_idx[0] += 1
+        last_retained[0] = index
 
-        # Update state for next window (potential point becomes current max)
-        # Note: We don't update potential_* variables here because they are
-        # output-only parameters in this context. The caller must update them.
+
+cdef inline void _process_window_state(
+    const double* x, const double* y,
+    Py_ssize_t* min_idx, Py_ssize_t* max_idx, Py_ssize_t* potential_idx,
+    int* previous_min_flag,
+    double* out_x, double* out_y,
+    Py_ssize_t* out_idx, Py_ssize_t* last_retained,
+) noexcept nogil:
+    """Retain the earlier extremum and carry the later one for compensation."""
+    if min_idx[0] < max_idx[0]:
+        if previous_min_flag[0] == 1 and potential_idx[0] >= 0:
+            _retain_index(x, y, potential_idx[0], out_x, out_y, out_idx, last_retained)
+        _retain_index(x, y, min_idx[0], out_x, out_y, out_idx, last_retained)
+        potential_idx[0] = max_idx[0]
+        min_idx[0] = max_idx[0]
         previous_min_flag[0] = 1
     else:
-        # Max came before Min (or same) - retain Max
-        if previous_min_flag[0] == 0 and has_potential[0]:
-            if max_x != potential_x or max_y != potential_y:
-                out_x[out_idx[0]] = potential_x
-                out_y[out_idx[0]] = potential_y
-                out_idx[0] += 1
-
-        out_x[out_idx[0]] = max_x
-        out_y[out_idx[0]] = max_y
-        out_idx[0] += 1
-
+        if previous_min_flag[0] == 0 and potential_idx[0] >= 0:
+            _retain_index(x, y, potential_idx[0], out_x, out_y, out_idx, last_retained)
+        _retain_index(x, y, max_idx[0], out_x, out_y, out_idx, last_retained)
+        potential_idx[0] = min_idx[0]
+        max_idx[0] = min_idx[0]
         previous_min_flag[0] = 0
-
-    # Caller must update potential point and has_potential flag
 
 
 cdef inline Py_ssize_t _downsample_core_ptr(
@@ -209,123 +173,69 @@ cdef inline Py_ssize_t _downsample_core_ptr(
     double* out_y,
 ) noexcept nogil:
     """
-    Core downsampling logic using raw pointers for maximum performance.
-
-    Handles NaN values by always retaining them (to preserve data gaps).
+    Downsample fixed windows, ignoring NaNs unless the whole window is missing.
     Handles ±Inf values as valid extrema in min/max comparison.
     """
     cdef:
-        # Current window extrema
-        double max_x, max_y
-        double min_x, min_y
-        # Potential point for compensation
-        double potential_x, potential_y
-        # Current point being processed
-        double px, py
-
-        # State flags
-        # previous_min_flag: -1 = no data, 0 = retained max, 1 = retained min
-        int previous_min_flag = -1
-        int counter = 0
-        bint has_potential = False
-        bint initialized = False
-
-        # Indices
+        Py_ssize_t min_idx = -1
+        Py_ssize_t max_idx = -1
+        Py_ssize_t potential_idx = -1
+        Py_ssize_t last_retained = -1
         Py_ssize_t out_idx = 0
+        Py_ssize_t i, start, end
+        double py
+        double min_y, max_y
+        int previous_min_flag = -1
+        bint has_valid
 
-        # Precompute for inner loop
-        const double* x_end = x + n
-        const double* x_ptr = x
-        const double* y_ptr = y
+    _retain_index(x, y, 0, out_x, out_y, &out_idx, &last_retained)
+    start = 0
+    while start < n:
+        end = start + ratio
+        if end > n:
+            end = n
+        has_valid = False
+        for i in range(start, end):
+            py = y[i]
+            if isnan(py):
+                continue
+            has_valid = True
+            if min_idx < 0:
+                min_idx = max_idx = i
+                min_y = max_y = py
+            elif py >= max_y:
+                max_idx = i
+                max_y = py
+            elif py < min_y:
+                min_idx = i
+                min_y = py
 
-    # Main processing loop
-    while x_ptr < x_end:
-        px = x_ptr[0]
-        py = y_ptr[0]
-        x_ptr += 1
-        y_ptr += 1
-
-        # Handle NaN: always retain but don't use for min/max
-        if isnan(py):
-            out_x[out_idx] = px
-            out_y[out_idx] = py
-            out_idx += 1
-            counter += 1
-            # Check window threshold (but NaN doesn't reset min/max)
-            if counter >= ratio:
-                # Process window if we have valid data
-                if initialized:
-                    _process_window_state(
-                        min_x, min_y, max_x, max_y, potential_x, potential_y,
-                        &previous_min_flag, &has_potential, out_x, out_y, &out_idx
-                    )
-
-                    # Update potential point based on what was retained
-                    if previous_min_flag == 1: # Retained Min
-                        potential_x = max_x
-                        potential_y = max_y
-                        min_x = max_x
-                        min_y = max_y
-                    else: # Retained Max
-                        potential_x = min_x
-                        potential_y = min_y
-                        max_x = min_x
-                        max_y = min_y
-                    has_potential = True
-
-                counter = 0
-            continue
-
-        # First valid (non-NaN) point initialization
-        if not initialized:
-            max_x = px
-            max_y = py
-            min_x = px
-            min_y = py
-            initialized = True
-            counter = 1
-            continue
-
-        counter += 1
-
-        # Update max/min - Inf values work correctly with comparisons
-        if py >= max_y:
-            max_x = px
-            max_y = py
-        elif py < min_y:
-            min_x = px
-            min_y = py
-
-        # Window complete check
-        if counter >= ratio:
+        if has_valid:
             _process_window_state(
-                min_x, min_y, max_x, max_y, potential_x, potential_y,
-                &previous_min_flag, &has_potential, out_x, out_y, &out_idx
+                x, y, &min_idx, &max_idx, &potential_idx, &previous_min_flag,
+                out_x, out_y, &out_idx, &last_retained,
             )
+            min_y = y[min_idx]
+            max_y = y[max_idx]
+        else:
+            if potential_idx >= 0:
+                _retain_index(x, y, potential_idx, out_x, out_y, &out_idx, &last_retained)
+            _retain_index(x, y, start, out_x, out_y, &out_idx, &last_retained)
+            min_idx = max_idx = potential_idx = -1
+            previous_min_flag = -1
+        start = end
 
-            # Update potential point based on what was retained
-            if previous_min_flag == 1: # Retained Min
-                potential_x = max_x
-                potential_y = max_y
-                min_x = max_x
-                min_y = max_y
-            else: # Retained Max
-                potential_x = min_x
-                potential_y = min_y
-                max_x = min_x
-                max_y = min_y
-            has_potential = True
-
-            counter = 0
-
-    # Flush remaining incomplete window
-    if counter > 0 and initialized:
-        _process_window_state(
-            min_x, min_y, max_x, max_y, potential_x, potential_y,
-            &previous_min_flag, &has_potential, out_x, out_y, &out_idx
-        )
+    if potential_idx >= 0:
+        _retain_index(x, y, potential_idx, out_x, out_y, &out_idx, &last_retained)
+    _retain_index(x, y, n - 1, out_x, out_y, &out_idx, &last_retained)
 
     return out_idx
+
+
+cdef inline Py_ssize_t _output_capacity(Py_ssize_t n, int ratio) noexcept nogil:
+    """Bound output size before writing to caller-owned buffers."""
+    cdef Py_ssize_t capacity = 2 * ((n - 1) // ratio + 1) + 2
+    return n if n < capacity else capacity
 
 
 # =============================================================================
@@ -343,8 +253,10 @@ def downsample_into(
     Downsample into pre-allocated output buffers.
 
     This avoids memory allocation overhead when called repeatedly.
-    The output buffers must be large enough to hold the results.
-    Recommended size: ((len(x) + ratio - 1) // ratio) * 2 + 2
+    Output buffers must not overlap the inputs or each other. A size of len(x)
+    is always sufficient. Smaller buffers must cover
+    min(len(x), 2 * ceil(len(x) / ratio) + 2). With ratio=1, len(x) is required.
+    The written prefix matches downsample(x, y, ratio).
 
     Parameters
     ----------
@@ -369,13 +281,20 @@ def downsample_into(
     if y_view.shape[0] != n:
         raise ValueError(f"x and y must have the same length")
 
-    if n == 0:
-        return 0
-
     if ratio < 1:
         raise ValueError(f"Sampling ratio must be >= 1, got {ratio}")
 
-    cdef Py_ssize_t max_output = ((n + ratio - 1) // ratio) * 2 + 2
+    if n == 0:
+        return 0
+
+    cdef np.ndarray out_x_arr = np.asarray(out_x)
+    cdef np.ndarray out_y_arr = np.asarray(out_y)
+    if (np.shares_memory(out_x_arr, x_arr) or np.shares_memory(out_x_arr, y_arr)
+            or np.shares_memory(out_y_arr, x_arr) or np.shares_memory(out_y_arr, y_arr)
+            or np.shares_memory(out_x_arr, out_y_arr)):
+        raise ValueError("Output buffers must not overlap the input arrays or each other.")
+
+    cdef Py_ssize_t max_output = _output_capacity(n, ratio)
 
     if out_x.shape[0] < max_output or out_y.shape[0] < max_output:
         raise ValueError(f"Output buffers too small. Need at least {max_output} elements.")
@@ -434,7 +353,7 @@ def downsample_batch(
     cdef list results = []
     cdef Py_ssize_t i
     cdef np.ndarray x_arr, y_arr
-    cdef double[::1] x_view, y_view
+    cdef const double[::1] x_view, y_view
 
     for i in range(num_series):
         x_arr = np.ascontiguousarray(x_arrays[i], dtype=np.float64)

@@ -16,12 +16,13 @@ publication.
 ## Why FPCS?
 
 Unlike simple decimation or even some advanced algorithms like LTTB, FPCS
-retains the min/max within each sampling window, helping preserve prominent
-peaks and valleys while allowing smaller local extrema to be dropped.
+selects sampling-window extrema and compensates across adjacent windows,
+helping preserve prominent peaks and valleys while allowing smaller local
+extrema to be dropped.
 
 ### Visual Comparison (FPCS vs LTTB)
-FPCS maintains the full range of the signal even at high downsampling ratios,
-whereas LTTB may miss sharp spikes in noisy datasets.
+FPCS helps retain prominent peaks and valleys at high downsampling ratios,
+whereas LTTB may miss sharp spikes in noisy datasets, as illustrated below.
 
 ![Comparison](figures/downsampling_comparison.png)
 
@@ -29,9 +30,10 @@ whereas LTTB may miss sharp spikes in noisy datasets.
 - **High Performance:** Cython-optimized core is competitive with optimized LTTB
   (see benchmarks below).
 - **Streaming data:** Supports incremental processing via `FPCSDownsampler`.
-- **Feature preserving:** Guarantees retention of min/max points within each
-  window.
-- **Robust:** Native handling of `NaN` and `Inf` values.
+- **Feature preserving:** Selects window extrema with compensation for
+  features that would otherwise be lost between windows.
+- **Robust:** Ignores `NaN` samples in mixed windows, marks missing windows,
+  and treats `±Inf` as extrema.
 - **Batched processing:** Efficiently downsample multiple series at once.
 
 ---
@@ -80,6 +82,20 @@ x_ds, y_ds = downsample(x, y, ratio=100)
 print(f"Original: {len(x)} points | Downsampled: {len(x_ds)} points")
 ```
 
+For `ratio > 1`, fixed windows span `ratio` consecutive input samples,
+including `NaN`s. Windows containing non-NaN samples ignore NaNs when selecting
+extrema using FPCS compensation. An all-NaN window, including a partial final
+window, retains its first NaN as a gap marker. Any pending extremum is emitted
+before that marker, and compensation resets. `±Inf` values remain valid extrema.
+The first and last input samples are always retained, even if they are NaN.
+Gaps inside mixed windows are deliberately hidden, connecting across missing
+samples. With `ratio=1`, every input point is retained.
+
+Output size is at most `min(n, 2 * ceil(n / ratio) + 2)`, where `n = len(x)`.
+The ratio controls window size rather than an exact output count. For a
+conservative budget of `target >= 4` points, use
+`ratio = max(1, math.ceil(n / ((target - 2) // 2)))` (after `import math`).
+
 ### Streaming data
 Processing data in real-time:
 ```python
@@ -108,9 +124,12 @@ The main entry point for batch processing.
     - `ratio` (int): The sampling window size (R). Must be >= 1.
 - **Returns:**
     - `(np.ndarray, np.ndarray)`: A tuple of `(x_downsampled, y_downsampled)`.
- - **Notes:**
-    - The first and last input points are always retained in batch mode.
-    - `NaN` values are always retained to preserve gaps.
+- **Notes:**
+    - The first and last input points are retained, even if NaN.
+    - Windows count all input samples, including NaNs. Mixed windows ignore
+      NaNs; all-NaN windows retain their first sample and reset compensation.
+    - Output is bounded by `min(n, 2 * ceil(n / ratio) + 2)`.
+    - `ratio=1` returns an exact copy, including every `NaN`.
     - `±Inf` values are treated as extrema.
     - Integer inputs are supported; the Cython backend converts them to float64.
 
@@ -124,18 +143,20 @@ Initialize the downsampler.
 #### `add(x: float, y: float) -> Iterator[tuple[float, float]]`
 Add a single point to the downsampler.
 - **Yields:** Tuples of `(x, y)` for any points retained during this step.
- - **Notes:**
-    - Streaming mode does **not** auto-include the first/last points; if you
-      need them, add them yourself.
-    - `NaN` values are always retained and `±Inf` values are treated as extrema.
+- **Notes:**
+    - Streaming uses the same fixed windows and NaN rules as batch processing.
+    - Call `flush()` to emit remaining points at the end of the stream.
+    - `±Inf` values are treated as extrema; `ratio=1` retains every point.
 
 #### `flush() -> Iterator[tuple[float, float]]`
 Flush any remaining points from the internal buffer (e.g., at the end of a
 stream).
 - **Yields:** Tuples of `(x, y)` for remaining points.
+- Finishes the partial window, pending extremum, and global endpoint.
+  Calling again without new data yields nothing. New data starts a fresh window.
 
 #### `reset()`
-Resets the downsampler state to initial conditions.
+Resets all window, compensation, and endpoint state to initial conditions.
 
 ### Advanced / Optimization API
 These functions are available when the Cython extension is successfully
@@ -146,10 +167,12 @@ Downsample into pre-allocated output buffers to reduce memory allocation
 overhead.
 - **Parameters:**
     - `x`, `y`: Input arrays (integer inputs are supported and converted to float64).
-    - `out_x`, `out_y`: Output buffers (contiguous float64, must be large enough).
-- **Returns:** Number of points written.
- - **Notes:** Recommended output buffer size is `((len(x) + ratio - 1) // ratio)
-   * 2 + 2`.
+    - `out_x`, `out_y`: Output buffers (contiguous float64, must be large enough
+      and must not overlap the inputs or each other).
+- **Returns:** Number of points written; the output matches `downsample`.
+- **Notes:** The required safe capacity is `min(n, 2 * ceil(n / ratio) + 2)`,
+  where `n = len(x)`, independent of sample values. Insufficient buffers are
+  rejected before any writes. With `ratio=1`, buffers require `len(x)` slots.
 
 #### `downsample_batch(x_arrays, y_arrays, ratio) -> List[tuple]`
 Efficiently process a list of time series. Reduces Python overhead compared to a
@@ -166,24 +189,32 @@ loop.
 
 ## Performance
 Comparison between FPCS (Python/Cython) and a C implementation of the LTTB
-algorithm.
+algorithm, using the current implementation on a dense signal of 1,000,000
+float64 points from `TestBenchmarks.benchmark_data` in `test_fpcs.py` (seed 42).
+The algorithm comparison uses `ratio=100` for FPCS and 12,500 output points
+for LTTB; the ratio-scaling table uses each listed ratio.
+
+Measured on Linux with Python 3.11.13, NumPy 1.26.4, Cython 3.1.2, and
+LTTBC 0.2.4, after warmup with at least 20 measured rounds per case, pinned
+to one CPU. All time columns are in milliseconds; OPS is calls per second.
+Timings vary with hardware and host load.
 
 **Algorithm comparison**
 
 | Name (time in ms) | Min | Max | Mean | StdDev | OPS |
 |:---|---:|---:|---:|---:|---:|
-| **Cython FPCS** | 1.2370 | 1.3534 | 1.2546 | 0.0162 | 797.0606 |
-| **LTTB (C impl)** | 2.5252 | 2.6372 | 2.5394 | 0.0166 | 393.7865 |
-| **Pure Python** | 393.6482 | 398.6493 | 395.6410 | 2.3321 | 2.5275 |
+| **Cython FPCS** | 1.4334 | 2.5953 | 1.4537 | 0.1106 | 687.9136 |
+| **LTTB (C impl)** | 2.4700 | 2.9949 | 2.4894 | 0.0400 | 401.7101 |
+| **Pure Python** | 448.6423 | 463.1361 | 453.8052 | 3.3927 | 2.2036 |
 
 **Ratio scaling (Cython)**
 
 | Ratio | Mean Time (ms) | StdDev |
 |:---|---:|---:|
-| **10** | 4.05 | 0.81 |
-| **50** | 3.86 | 0.89 |
-| **100** | 4.02 | 0.90 |
-| **500** | 4.32 | 0.74 |
+| **10** | 3.66 | 0.04 |
+| **50** | 1.85 | 0.10 |
+| **100** | 1.46 | 0.13 |
+| **500** | 1.05 | 0.01 |
 
 ## License
 This project is licensed under the MIT Licence - see the LICENSE file for details.
