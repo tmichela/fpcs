@@ -27,12 +27,21 @@ class FPCSDownsampler:
     This class implements the FPCS algorithm for streaming data, allowing
     points to be added one at a time and retained points to be yielded.
 
+    To match batch processing with the same input precision, flush only at the
+    end. Each flush resets window and compensation state, so frequent flushing
+    changes compression and can change gap visibility. Integer comparisons are
+    retained; Cython batch APIs convert inputs to float64 and can select different
+    extrema for integers outside [-2**53, 2**53].
+
     Parameters
     ----------
     ratio : int
         The window size R, counting all samples including NaNs. Must be >= 1.
         Mixed windows ignore NaNs; all-NaN windows retain one gap marker.
-        Output is bounded by min(n, 2 * ceil(n / R) + 2), including endpoints.
+        Each flushed segment is bounded by min(n, 2 * ceil(n / R) + 2), including
+        endpoints, where n is its input length. Sum these bounds across segments.
+        An interior gap of up to 2 * R - 2 NaNs can disappear, depending on window
+        alignment; there is no elapsed-time limit on hidden gaps.
 
     Example
     -------
@@ -166,6 +175,9 @@ class FPCSDownsampler:
 
         Call this at the end of the stream to retain pending extrema and the
         last endpoint. Repeated calls yield nothing until new points are added.
+        New points start a fresh segment with reset windows and compensation;
+        its output bound applies separately. Intermediate flushes change
+        compression and can change gap visibility.
 
         Yields
         ------
@@ -199,6 +211,15 @@ def downsample(
     selecting extrema; all-NaN windows retain one gap marker and reset
     compensation. Global endpoints are retained, even if NaN. With ratio=1,
     all points are retained.
+
+    An interior gap of up to 2 * ratio - 2 NaNs can disappear, depending on
+    window alignment. Windows count samples, not elapsed time. To preserve
+    visible gaps, downsample contiguous non-NaN runs separately and retain NaN
+    separators; the output bound applies per run, with separators added.
+    Integer comparisons are retained. Cython batch APIs convert inputs to
+    float64, so exact values and selected extrema can differ for integers
+    outside [-2**53, 2**53]. For large integer timestamps, subtract an integer
+    origin before conversion to preserve plotting resolution.
 
     Parameters
     ----------

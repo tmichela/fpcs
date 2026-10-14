@@ -91,6 +91,13 @@ The first and last input samples are always retained, even if they are NaN.
 Gaps inside mixed windows are deliberately hidden, connecting across missing
 samples. With `ratio=1`, every input point is retained.
 
+Depending on window alignment, an interior gap of up to `2 * ratio - 2`
+consecutive NaNs can disappear entirely. Windows count samples, not elapsed
+time, so a hidden gap can span arbitrarily long intervals with irregular
+timestamps. To preserve gaps in a line plot, downsample contiguous non-NaN
+runs separately and retain NaN separators between them. The output bound
+then applies to each run separately; the total also includes the separators.
+
 Output size is at most `min(n, 2 * ceil(n / ratio) + 2)`, where `n = len(x)`.
 The ratio controls window size rather than an exact output count. For a
 conservative budget of `target >= 4` points, use
@@ -114,6 +121,13 @@ for rx, ry in downsampler.flush():
     update_plot(rx, ry)
 ```
 
+To match batch processing with the same input precision, flush only at the end.
+Each flush finishes a segment and resets window and compensation state.
+The bound `min(n, 2 * ceil(n / ratio) + 2)` applies separately to each segment,
+where `n` counts samples since the previous flush (or stream start). Across
+multiple segments, sum their individual bounds. Frequent flushing changes
+compression and can change gap visibility.
+
 ## API Reference
 
 ### `downsample(x, y, ratio)`
@@ -129,9 +143,15 @@ The main entry point for batch processing.
     - Windows count all input samples, including NaNs. Mixed windows ignore
       NaNs; all-NaN windows retain their first sample and reset compensation.
     - Output is bounded by `min(n, 2 * ceil(n / ratio) + 2)`.
-    - `ratio=1` returns an exact copy, including every `NaN`.
+    - `ratio=1` retains every input sample, including every `NaN`.
     - `±Inf` values are treated as extrema.
-    - Integer inputs are supported; the Cython backend converts them to float64.
+    - Integer inputs are supported; all Cython batch APIs convert them to float64.
+      Integers outside `[-2**53, 2**53]` may round, losing exact values.
+      Python batch and streaming retain integer comparisons, so selected extrema
+      can differ between backends for large integers. For large integer
+      timestamps, subtract an integer origin before converting to float64 to
+      preserve plotting resolution; subtracting after conversion cannot recover
+      lost precision.
 
 ### `FPCSDownsampler`
 Class for streaming/incremental downsampling.

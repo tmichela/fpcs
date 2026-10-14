@@ -101,6 +101,15 @@ def downsample(
     compensation. Global endpoints are retained, even if NaN. With ratio=1,
     all points are retained.
 
+    An interior gap of up to 2 * ratio - 2 NaNs can disappear, depending on
+    window alignment. Windows count samples, not elapsed time. To preserve
+    visible gaps, downsample contiguous non-NaN runs separately and retain NaN
+    separators; the output bound applies per run, with separators added.
+    Inputs are converted to float64, including with ratio=1. Integers outside
+    [-2**53, 2**53] may round, losing exact values and changing selected extrema
+    relative to Python batch or streaming. For large integer timestamps,
+    subtract an integer origin before conversion to preserve plotting resolution.
+
     Parameters
     ----------
     x : array-like
@@ -257,6 +266,7 @@ def downsample_into(
     is always sufficient. Smaller buffers must cover
     min(len(x), 2 * ceil(len(x) / ratio) + 2). With ratio=1, len(x) is required.
     The written prefix matches downsample(x, y, ratio).
+    The same gap visibility and float64 integer precision limits apply.
 
     Parameters
     ----------
@@ -330,6 +340,8 @@ def downsample_batch(
 
     More efficient than calling downsample() in a loop due to reduced
     Python overhead.
+    Each series follows downsample(), including its gap visibility and
+    float64 integer precision limits.
 
     Parameters
     ----------
