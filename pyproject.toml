@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools", "wheel", "numpy", "cython"]
+requires = ["setuptools>=80", "setuptools-scm>=8", "wheel", "numpy", "cython"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -44,8 +44,9 @@ package-dir = {"" = "src"}
 packages = ["fpcs"]
 
 [tool.setuptools.dynamic]
-version = { attr = "fpcs.__version__" }
 readme = { file = ["README.md"], content-type = "text/markdown" }
+
+[tool.setuptools_scm]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

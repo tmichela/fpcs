@@ -5,7 +5,12 @@ A high-performance time series downsampling algorithm that preserves
 important visual features (peaks, valleys) while reducing data size.
 """
 
-__version__ = "1.0.0"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("fpcs")
+except PackageNotFoundError:
+    __version__ = "0+unknown"
 
 # Try to import optimized Cython implementation first
 try:
