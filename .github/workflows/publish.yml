@@ -17,7 +17,9 @@ jobs:
           fetch-depth: 0
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v3.3.1
+        uses: pypa/cibuildwheel@v4.3.1
+        env:
+          CIBW_BUILD: "cp3{11,12,13,14}*"
 
       - uses: actions/upload-artifact@v6
         with:
