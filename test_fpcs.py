@@ -818,41 +818,44 @@ class TestOutputBufferCapacity:
 
 @pytest.mark.skipif(get_backend() != "cython", reason="Cython not available")
 class TestOutputBufferOverlap:
+    @pytest.mark.parametrize("input_step", [1, 2, -2])
+    @pytest.mark.parametrize("input_dtype", [np.float64, np.int64])
     @pytest.mark.parametrize("overlap", ["input-x", "input-y", "input-x-to-y", "input-y-to-x", "outputs"])
-    def test_overlap_is_rejected_before_writing(self, overlap):
-        x = np.arange(24, dtype=np.float64)
-        y = np.arange(24, dtype=np.float64) ** 2
+    def test_overlap_is_rejected_before_writing(self, overlap, input_dtype, input_step):
+        x = np.arange(24, dtype=input_dtype)
+        y = np.arange(24, dtype=input_dtype) ** 2
         out_x = np.full(12, -12345.0)
         out_y = np.full(12, -67890.0)
         if overlap == "input-x":
-            out_x = x[6:18]
+            out_x = x[6:18].view(np.float64)
         elif overlap == "input-y":
-            out_y = y[6:18]
+            out_y = y[6:18].view(np.float64)
         elif overlap == "input-x-to-y":
-            out_y = x[6:18]
+            out_y = x[6:18].view(np.float64)
         elif overlap == "input-y-to-x":
-            out_x = y[6:18]
+            out_x = y[6:18].view(np.float64)
         else:
             shared = np.full(24, -12345.0)
             out_x, out_y = shared[:12], shared[6:18]
         arrays = (x, y, out_x, out_y)
         before = [array.copy() for array in arrays]
         with pytest.raises(ValueError, match="overlap"):
-            downsample_into(x[:12], y[:12], 4, out_x, out_y)
+            downsample_into(x[::input_step][:12], y[::input_step][:12], 4, out_x, out_y)
         for actual, expected in zip(arrays, before):
             np.testing.assert_array_equal(actual, expected)
 
-    def test_disjoint_slices_of_one_allocation_are_allowed(self):
+    @pytest.mark.parametrize("input_step", [1, 2, -2])
+    def test_disjoint_slices_of_one_allocation_are_allowed(self, input_step):
         x_storage = np.arange(36, dtype=np.float64)
         y_storage = x_storage ** 2
-        x, out_x = x_storage[:12], x_storage[12:24]
-        y, out_y = y_storage[:12], y_storage[12:24]
+        x, out_x = x_storage[:12][::input_step], x_storage[12:24]
+        y, out_y = y_storage[:12][::input_step], y_storage[12:24]
         expected_x, expected_y = downsample(x, y, 4)
         count = downsample_into(x, y, 4, out_x, out_y)
         np.testing.assert_array_equal(out_x[:count], expected_x)
         np.testing.assert_array_equal(out_y[:count], expected_y)
-        np.testing.assert_array_equal(x, np.arange(12))
-        np.testing.assert_array_equal(y, np.arange(12) ** 2)
+        np.testing.assert_array_equal(x, np.arange(12)[::input_step])
+        np.testing.assert_array_equal(y, (np.arange(12) ** 2)[::input_step])
 
 
 class TestInfHandling:

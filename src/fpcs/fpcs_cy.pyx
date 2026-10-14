@@ -289,8 +289,8 @@ def downsample_into(
 
     cdef np.ndarray out_x_arr = np.asarray(out_x)
     cdef np.ndarray out_y_arr = np.asarray(out_y)
-    if (np.shares_memory(out_x_arr, x_arr) or np.shares_memory(out_x_arr, y_arr)
-            or np.shares_memory(out_y_arr, x_arr) or np.shares_memory(out_y_arr, y_arr)
+    if (np.shares_memory(out_x_arr, x) or np.shares_memory(out_x_arr, y)
+            or np.shares_memory(out_y_arr, x) or np.shares_memory(out_y_arr, y)
             or np.shares_memory(out_x_arr, out_y_arr)):
         raise ValueError("Output buffers must not overlap the input arrays or each other.")
 
