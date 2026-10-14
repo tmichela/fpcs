@@ -42,6 +42,43 @@ def large_data():
     return x, y
 
 
+def _stream_downsample(x, y, ratio):
+    downsampler = FPCSDownsampler(ratio)
+    retained = []
+    for xi, yi in zip(x, y):
+        retained.extend(downsampler.add(xi, yi))
+    retained.extend(downsampler.flush())
+    if not retained:
+        return np.array([]), np.array([])
+    return np.asarray(retained).T
+
+
+@pytest.fixture(params=["python", "streaming", "main", "into", "batch"])
+def gap_downsample(request):
+    """Exercise the same gap contract through each public entry point."""
+    if request.param == "python":
+        return fpcs_pure.downsample
+    if request.param == "streaming":
+        return _stream_downsample
+    if request.param == "main":
+        return downsample
+    if get_backend() != "cython":
+        pytest.skip("Cython not available")
+    if request.param == "batch":
+        return lambda x, y, ratio: downsample_batch([x], [y], ratio)[0]
+
+    def into(x, y, ratio):
+        out_x = np.full(len(x) + 2, -12345.0)
+        out_y = np.full(len(x) + 2, -67890.0)
+        count = downsample_into(x, y, ratio, out_x[1:-1], out_y[1:-1])
+        assert 0 <= count <= len(x)
+        np.testing.assert_array_equal(out_x[[0, -1]], [-12345.0, -12345.0])
+        np.testing.assert_array_equal(out_y[[0, -1]], [-67890.0, -67890.0])
+        return out_x[1:count + 1], out_y[1:count + 1]
+
+    return into
+
+
 # =============================================================================
 # Backend Info
 # =============================================================================
@@ -142,7 +179,7 @@ class TestPythonStreaming:
         x, y = sinusoidal_data
         ratio = 10
 
-        # Streaming (note: streaming does NOT auto-include first/last points)
+        # Streaming preserves the same endpoints as batch processing.
         downsampler = FPCSDownsampler(ratio)
         x_stream = []
         y_stream = []
@@ -160,25 +197,68 @@ class TestPythonStreaming:
         assert len(x_stream) > 0
         assert len(x_stream) < len(x)  # Downsampled
 
-    def test_reset(self):
+    @pytest.mark.parametrize("values", [
+        [3, 1, 9, 2],
+        [np.nan, np.nan],
+        [3, 1, 9, 2, np.nan, np.nan],
+    ])
+    def test_reset(self, values):
         """Reset should clear internal state."""
-        downsampler = FPCSDownsampler(ratio=5)
-
-        # Add some points
-        for i in range(10):
-            list(downsampler.add(float(i), float(i)))
-
-        # Reset
+        downsampler = FPCSDownsampler(ratio=4)
+        for i, yi in enumerate(values):
+            list(downsampler.add(float(i), yi))
         downsampler.reset()
 
-        # State should be cleared
-        assert downsampler._counter == 0
-        assert not downsampler._initialized
+        x = np.arange(100, 108, dtype=np.float64)
+        y = np.array([np.nan, np.nan, 4, -2, 8, 0, np.nan, np.nan])
+        retained = []
+        for xi, yi in zip(x, y):
+            retained.extend(downsampler.add(xi, yi))
+        retained.extend(downsampler.flush())
+        expected_x, expected_y = _stream_downsample(x, y, ratio=4)
+        actual_x, actual_y = np.asarray(retained).T
+        np.testing.assert_array_equal(actual_x, expected_x)
+        np.testing.assert_array_equal(actual_y, expected_y)
+
+    @pytest.mark.parametrize("values", [
+        [np.nan] * 20,
+        [3, 1, 9, 2],
+        [np.nan, 3, 1, 9, 2, np.nan, np.nan],
+    ])
+    def test_flush_is_idempotent(self, values):
+        downsampler = FPCSDownsampler(ratio=4)
+        retained = []
+        for i, yi in enumerate(values):
+            retained.extend(downsampler.add(float(i), yi))
+        retained.extend(downsampler.flush())
+        assert list(downsampler.flush()) == []
+        expected_x, expected_y = fpcs_pure.downsample(np.arange(len(values)), values, 4)
+        actual_x, actual_y = np.asarray(retained).T
+        np.testing.assert_array_equal(actual_x, expected_x)
+        np.testing.assert_array_equal(actual_y, expected_y)
 
     def test_invalid_ratio(self):
         """Ratio < 1 should raise ValueError."""
         with pytest.raises(ValueError, match="ratio must be >= 1"):
             FPCSDownsampler(ratio=0)
+
+    @pytest.mark.parametrize("prefix", [[3, 1, 9, 2], [3, np.nan], [np.nan] * 6])
+    def test_new_data_after_flush_starts_fresh_windows(self, prefix):
+        downsampler = FPCSDownsampler(ratio=4)
+        for i, yi in enumerate(prefix):
+            list(downsampler.add(float(i), yi))
+        list(downsampler.flush())
+        assert list(downsampler.flush()) == []
+
+        values = [np.nan, 3, 1, 9, 2, np.nan]
+        retained = []
+        for i, yi in enumerate(values, start=len(prefix)):
+            retained.extend(downsampler.add(float(i), yi))
+        retained.extend(downsampler.flush())
+        indices = np.array([0, 2, 3, 4, 5])
+        actual_x, actual_y = np.asarray(retained).T
+        np.testing.assert_array_equal(actual_x, indices + len(prefix))
+        np.testing.assert_array_equal(actual_y, np.asarray(values)[indices])
 
 
 # =============================================================================
@@ -256,7 +336,7 @@ class TestMainAPI:
 # =============================================================================
 
 class TestFirstLastPointRetention:
-    """Tests for batch mode always retaining first and last data points."""
+    """Tests for all interfaces retaining first and last data points."""
 
     def test_first_point_retained(self, sinusoidal_data):
         """First point should always be retained in batch mode."""
@@ -285,20 +365,14 @@ class TestFirstLastPointRetention:
         assert x_out[0] == x[0]
         assert x_out[-1] == x[-1]
 
-    def test_streaming_does_not_force_first_last(self):
-        """Streaming mode should NOT auto-include first/last points."""
+    def test_streaming_retains_first_last(self):
+        """Streaming preserves endpoints even before a window completes."""
         x = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], dtype=np.float64)
         y = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], dtype=np.float64)  # monotonic
 
-        downsampler = FPCSDownsampler(ratio=100)  # Large ratio, won't trigger window
-        results = []
-        for xi, yi in zip(x, y):
-            results.extend(list(downsampler.add(xi, yi)))
-        results.extend(list(downsampler.flush()))
-
-        # With ratio=100 on 10 points, the streaming algorithm processes
-        # all points in one window and flushes the result
-        assert len(results) > 0
+        x_out, y_out = _stream_downsample(x, y, ratio=100)
+        np.testing.assert_array_equal(x_out, x[[0, -1]])
+        np.testing.assert_array_equal(y_out, y[[0, -1]])
 
     def test_python_and_cython_first_last_match(self, sinusoidal_data):
         """Python and Cython should produce same first/last points."""
@@ -398,7 +472,7 @@ class TestBenchmarks:
     @pytest.mark.benchmark(group="ratio-scaling")
     def test_benchmark_cython_ratios(self, benchmark, benchmark_data, ratio):
         """Benchmark Cython at different ratios."""
-        x, y, ratio = benchmark_data
+        x, y, _ = benchmark_data
         result = benchmark(downsample, x, y, ratio)
         assert len(result[0]) > 0
 
@@ -506,8 +580,8 @@ class TestEdgeCases:
 class TestNaNHandling:
     """Tests for NaN value handling."""
 
-    def test_nan_values_retained(self):
-        """NaN values should be retained in output."""
+    def test_nans_in_mixed_windows_are_ignored(self):
+        """Valid samples hide missing samples within the same window."""
         x = np.arange(20, dtype=np.float64)
         y = np.sin(x * 0.5)
         y[5] = np.nan
@@ -515,8 +589,7 @@ class TestNaNHandling:
 
         x_out, y_out = downsample(x, y, ratio=5)
 
-        nan_count = np.isnan(y_out).sum()
-        assert nan_count == 2, f"Expected 2 NaN values, got {nan_count}"
+        assert not np.any(np.isnan(y_out))
 
     def test_nan_at_start(self):
         """NaN at start of data should be handled."""
@@ -562,6 +635,227 @@ class TestNaNHandling:
 
         # Check same number of NaN values
         assert np.isnan(y_py).sum() == np.isnan(y_main).sum()
+
+
+class TestGapCompression:
+    @pytest.mark.parametrize("values,ratio,indices", [
+        pytest.param(np.full(1000, np.nan), 10, [*range(0, 1000, 10), 999], id="all-nan"),
+        pytest.param(
+            np.r_[np.full(9, np.nan), 7, np.full(990, np.nan)],
+            10, [0, 9, *range(10, 1000, 10), 999], id="isolated-valid-point",
+        ),
+        pytest.param([np.nan], 10, [0], id="single-nan"),
+        pytest.param([np.nan, np.nan], 10, [0, 1], id="two-nans"),
+        pytest.param([np.nan] * 5 + [7] + [np.nan] * 5, 100, [0, 5, 10], id="singleton-valid"),
+        pytest.param([3, 1, 9, 2], 100, [0, 1, 2, 3], id="finite-terminal-extrema"),
+        pytest.param([3, 9, 1, 2], 100, [0, 1, 2, 3], id="max-before-min"),
+        pytest.param([5, 5, 5, 5], 100, [0, 3], id="constant-finite-run"),
+        pytest.param([np.nan, 5, np.nan, 5, np.nan], 100, [0, 1, 3, 4], id="mixed-flat"),
+        pytest.param([np.nan, 1, np.nan, 2, 3, np.nan], 100, [0, 1, 4, 5], id="mixed-monotone"),
+        pytest.param([3, 1, 9, np.nan, 2, 8, 0, 7], 4, [0, 1, 2, 6, 7], id="nan-counts-toward-boundary"),
+        pytest.param([3, 1, np.nan, np.nan, np.nan, np.nan, 9, 2], 4, [0, 1, 6, 7], id="gap-straddles-mixed-windows"),
+        pytest.param(
+            [3, 1, 9, 2, np.nan, np.nan, np.nan], 4,
+            [0, 1, 2, 4, 6], id="all-nan-partial-window",
+        ),
+        pytest.param(
+            [3, 1, 9, 2] + [np.nan] * 4 + [5, -4, 8, 6],
+            4, [0, 1, 2, 4, 9, 10, 11], id="gap-flushes-compensation",
+        ),
+        pytest.param(
+            [3, 1, 9, 2] + [np.nan] * 4 + [5, -4, 8, 6],
+            100, [0, 2, 9, 11], id="two-islands-in-one-window",
+        ),
+        pytest.param(
+            [3, 1, 9, 2] + [np.nan] * 6,
+            4, [0, 1, 2, 4, 8, 9], id="all-nan-full-and-partial-windows",
+        ),
+        pytest.param(
+            [4, 3, 1, 5, 9, 6, 2] + [np.nan] * 4 + [7],
+            100, [0, 2, 4, 11], id="island-endpoints-are-not-retained",
+        ),
+        pytest.param(
+            [np.nan, 3, 1, 9, 2, np.nan], 100, [0, 2, 3, 5], id="global-nan-endpoints",
+        ),
+        pytest.param(
+            [np.nan, 1, np.nan, 3, np.nan, 2, np.nan],
+            100, [0, 1, 3, 6], id="fragmented-gaps",
+        ),
+        pytest.param(
+            [np.nan, 0, np.inf, -np.inf, 1, np.nan, np.nan],
+            100, [0, 2, 3, 6], id="infinities-are-valid",
+        ),
+    ])
+    def test_fixed_windows_retain_extrema_and_all_nan_markers(self, gap_downsample, values, ratio, indices):
+        y = np.asarray(values, dtype=np.float64)
+        x = np.arange(len(y), dtype=np.float64)
+        x_out, y_out = gap_downsample(x, y, ratio)
+        np.testing.assert_array_equal(x_out, x[indices])
+        np.testing.assert_array_equal(y_out, y[indices])
+
+    @pytest.mark.parametrize("values", [
+        [], [np.nan] * 20, [np.nan, 3, 1, np.nan, 9, np.nan, np.nan], [3, 1, 9, 2],
+    ])
+    def test_ratio_one_is_identity(self, gap_downsample, values):
+        y = np.asarray(values, dtype=np.float64)
+        x = np.zeros(len(y), dtype=np.float64)
+        x_out, y_out = gap_downsample(x, y, 1)
+        np.testing.assert_array_equal(x_out, x)
+        np.testing.assert_array_equal(y_out, y)
+
+    @pytest.mark.parametrize("ratio", [1, 4, 100])
+    def test_readonly_inputs(self, gap_downsample, ratio):
+        y = np.array([np.nan, np.nan, 3, 1, 9, 2, np.nan, np.nan, 5, 8, -4, 6, np.nan])
+        x = np.arange(len(y), dtype=np.float64)
+        x.flags.writeable = False
+        y.flags.writeable = False
+        expected_x, expected_y = fpcs_pure.downsample(x, y, ratio)
+        x_out, y_out = gap_downsample(x, y, ratio)
+        np.testing.assert_array_equal(x_out, expected_x)
+        np.testing.assert_array_equal(y_out, expected_y)
+
+    @pytest.mark.parametrize("values,indices", [
+        (
+            [3, 1, 9, 2] + [np.nan] * 4 + [5, 8, -4, 6] + [np.nan] * 3,
+            [0, 1, 2, 4, 9, 10, 12, 14],
+        ),
+        ([5] * 4 + [np.nan] * 4 + [5] * 3, [0, 3, 4, 8, 10]),
+    ])
+    def test_repeated_timestamps_preserve_source_order(self, gap_downsample, values, indices):
+        y = np.asarray(values, dtype=np.float64)
+        x = np.zeros(len(y), dtype=np.float64)
+        x_out, y_out = gap_downsample(x, y, 4)
+        np.testing.assert_array_equal(x_out, x[indices])
+        np.testing.assert_array_equal(y_out, y[indices])
+
+    def test_inserting_nans_shifts_window_boundaries(self, gap_downsample):
+        values = np.array([3, 1, 9, 2, 8, 0, 7, 4], dtype=np.float64)
+        x_out, _ = gap_downsample(np.arange(len(values)), values, 4)
+        np.testing.assert_array_equal(x_out, [0, 1, 2, 5, 7])
+        y = np.r_[np.nan, np.nan, values]
+        x_out, y_out = gap_downsample(np.arange(len(y)), y, 4)
+        indices = [0, 2, 3, 4, 7, 8, 9]
+        np.testing.assert_array_equal(x_out, indices)
+        np.testing.assert_array_equal(y_out, y[indices])
+
+    @pytest.mark.parametrize("ratio", [1, 2, 9, 100, 1000])
+    def test_random_sparse_output_bound_source_order_and_parity(self, gap_downsample, ratio):
+        rng = np.random.default_rng(731)
+        for size in [0, 1, 2, 17, 300]:
+            y = rng.standard_normal(size)
+            y[rng.random(size) < 0.92] = np.nan
+            y[100:150] = rng.standard_normal(len(y[100:150]))
+            x = np.arange(size, dtype=np.float64)
+            x_out, y_out = gap_downsample(x, y, ratio)
+            indices = x_out.astype(np.intp)
+            assert np.all(np.diff(indices) > 0)
+            assert len(indices) <= min(size, 2 * ((size + ratio - 1) // ratio) + 2)
+            np.testing.assert_array_equal(x_out, x[indices])
+            np.testing.assert_array_equal(y_out, y[indices])
+            if size:
+                assert indices[0] == 0
+                assert indices[-1] == size - 1
+
+            markers = {start for start in range(0, size, ratio)
+                       if np.all(np.isnan(y[start:start + ratio]))}
+            markers.update(index for index in [0, size - 1]
+                           if size and np.isnan(y[index]))
+            assert set(indices[np.isnan(y_out)]) == markers
+            expected_x, expected_y = fpcs_pure.downsample(x, y, ratio)
+            np.testing.assert_array_equal(x_out, expected_x)
+            np.testing.assert_array_equal(y_out, expected_y)
+
+    def test_million_fragmented_samples_have_window_bounded_output(self):
+        y = np.tile([np.nan, 1.0, np.nan, 2.0], 250_000)
+        x = np.arange(len(y), dtype=np.float64)
+        ratio = max(1, int(len(y) / (0.8 * 150)))
+        x_out, y_out = downsample(x, y, ratio)
+        assert len(x_out) <= 2 * ((len(y) + ratio - 1) // ratio) + 2
+        assert x_out[0] == 0
+        assert x_out[-1] == len(y) - 1
+        assert np.isnan(y_out).sum() == 1
+        np.testing.assert_array_equal(y_out, y[x_out.astype(np.intp)])
+
+
+@pytest.mark.skipif(get_backend() != "cython", reason="Cython not available")
+@pytest.mark.parametrize("values,ratio,capacity", [
+    pytest.param([], 10, 0, id="empty"),
+    pytest.param([7], 10, 1, id="one-valid-point"),
+    pytest.param(np.full(1000, np.nan), 10, 202, id="all-nan"),
+    pytest.param(np.tile([np.nan, 2.0], 32), 20, 10, id="fragmented-gaps"),
+    pytest.param(np.r_[np.nan, np.arange(25), np.full(4, np.nan)], 10, 8, id="mixed-runs"),
+    pytest.param([np.nan, 2, np.nan, 3], 1, 4, id="ratio-one"),
+    pytest.param(np.arange(40), 10, 10, id="dense-conservative-bound"),
+])
+class TestOutputBufferCapacity:
+    def test_documented_capacity_is_sufficient(self, values, ratio, capacity):
+        y = np.asarray(values, dtype=np.float64)
+        x = np.arange(len(y), dtype=np.float64)
+        out_x = np.full(capacity + 2, -12345.0)
+        out_y = np.full(capacity + 2, -67890.0)
+        count = downsample_into(x, y, ratio, out_x[1:-1], out_y[1:-1])
+        expected_x, expected_y = downsample(x, y, ratio)
+        np.testing.assert_array_equal(out_x[1:count + 1], expected_x)
+        np.testing.assert_array_equal(out_y[1:count + 1], expected_y)
+        np.testing.assert_array_equal(out_x[[0, -1]], [-12345.0, -12345.0])
+        np.testing.assert_array_equal(out_y[[0, -1]], [-67890.0, -67890.0])
+
+    @pytest.mark.parametrize("short_buffer", ["x", "y"])
+    def test_undersized_buffer_is_rejected_before_writing(self, values, ratio, capacity, short_buffer):
+        if capacity == 0:
+            pytest.skip("An empty result needs no buffer space")
+        y = np.asarray(values, dtype=np.float64)
+        x = np.arange(len(y), dtype=np.float64)
+        out_x = np.full(2 * len(y) + 8, -12345.0)
+        out_y = np.full(2 * len(y) + 8, -67890.0)
+        size_x = capacity - (short_buffer == "x")
+        size_y = capacity - (short_buffer == "y")
+        with pytest.raises(ValueError, match="too small"):
+            downsample_into(x, y, ratio, out_x[2:2 + size_x], out_y[2:2 + size_y])
+        np.testing.assert_array_equal(out_x, np.full(out_x.shape, -12345.0))
+        np.testing.assert_array_equal(out_y, np.full(out_y.shape, -67890.0))
+
+
+@pytest.mark.skipif(get_backend() != "cython", reason="Cython not available")
+class TestOutputBufferOverlap:
+    @pytest.mark.parametrize("input_step", [1, 2, -2])
+    @pytest.mark.parametrize("input_dtype", [np.float64, np.int64])
+    @pytest.mark.parametrize("overlap", ["input-x", "input-y", "input-x-to-y", "input-y-to-x", "outputs"])
+    def test_overlap_is_rejected_before_writing(self, overlap, input_dtype, input_step):
+        x = np.arange(24, dtype=input_dtype)
+        y = np.arange(24, dtype=input_dtype) ** 2
+        out_x = np.full(12, -12345.0)
+        out_y = np.full(12, -67890.0)
+        if overlap == "input-x":
+            out_x = x[6:18].view(np.float64)
+        elif overlap == "input-y":
+            out_y = y[6:18].view(np.float64)
+        elif overlap == "input-x-to-y":
+            out_y = x[6:18].view(np.float64)
+        elif overlap == "input-y-to-x":
+            out_x = y[6:18].view(np.float64)
+        else:
+            shared = np.full(24, -12345.0)
+            out_x, out_y = shared[:12], shared[6:18]
+        arrays = (x, y, out_x, out_y)
+        before = [array.copy() for array in arrays]
+        with pytest.raises(ValueError, match="overlap"):
+            downsample_into(x[::input_step][:12], y[::input_step][:12], 4, out_x, out_y)
+        for actual, expected in zip(arrays, before):
+            np.testing.assert_array_equal(actual, expected)
+
+    @pytest.mark.parametrize("input_step", [1, 2, -2])
+    def test_disjoint_slices_of_one_allocation_are_allowed(self, input_step):
+        x_storage = np.arange(36, dtype=np.float64)
+        y_storage = x_storage ** 2
+        x, out_x = x_storage[:12][::input_step], x_storage[12:24]
+        y, out_y = y_storage[:12][::input_step], y_storage[12:24]
+        expected_x, expected_y = downsample(x, y, 4)
+        count = downsample_into(x, y, 4, out_x, out_y)
+        np.testing.assert_array_equal(out_x[:count], expected_x)
+        np.testing.assert_array_equal(out_y[:count], expected_y)
+        np.testing.assert_array_equal(x, np.arange(12)[::input_step])
+        np.testing.assert_array_equal(y, (np.arange(12) ** 2)[::input_step])
 
 
 class TestInfHandling:
