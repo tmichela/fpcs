@@ -6,9 +6,13 @@ Run benchmarks: pytest test_fpcs.py -v -k benchmark --benchmark-only
 """
 from packaging import version
 
+import importlib
+import importlib.metadata
+
 import numpy as np
 import pytest
 
+import fpcs
 from fpcs import downsample, FPCSDownsampler, get_backend, downsample_into, downsample_batch
 from fpcs import fpcs_pure
 
@@ -89,6 +93,23 @@ class TestBackend:
     def test_backend_is_valid(self):
         """Backend should be 'cython' or 'python'."""
         assert get_backend() in ("cython", "python")
+
+
+@pytest.mark.parametrize("installed", [True, False])
+def test_package_version(monkeypatch, installed):
+    def metadata_version(name):
+        assert name == "fpcs"
+        if not installed:
+            raise importlib.metadata.PackageNotFoundError(name)
+        return "1.2.3.dev4+g1234567"
+
+    with monkeypatch.context() as patch:
+        patch.setattr(importlib.metadata, "version", metadata_version)
+        importlib.reload(fpcs)
+        assert fpcs.__version__ == (
+            "1.2.3.dev4+g1234567" if installed else "0+unknown"
+        )
+    importlib.reload(fpcs)
 
 
 # =============================================================================
