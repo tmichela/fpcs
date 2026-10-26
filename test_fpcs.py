@@ -8,6 +8,8 @@ from packaging import version
 
 import importlib
 import importlib.metadata
+from decimal import Decimal
+from fractions import Fraction
 
 import numpy as np
 import pytest
@@ -692,6 +694,57 @@ class TestNonFiniteHandling:
         indices = [0, 2] if ratio > len(x) else [0, 1, 2]
         np.testing.assert_array_equal(x_out, x[indices])
         np.testing.assert_array_equal(y_out, y[indices])
+
+    @pytest.mark.parametrize("sample", [fpcs_pure.downsample, _stream_downsample])
+    @pytest.mark.parametrize("ratio,indices", [
+        (1, [0, 2, 3, 4, 5, 6, 8, 9, 10, 11]),
+        (4, [0, 2, 3, 6, 8, 11]),
+        (100, [0, 3, 11]),
+    ])
+    @pytest.mark.parametrize("numeric", [int, float, Fraction, Decimal, np.longdouble])
+    def test_python_numeric_object_arrays(self, sample, ratio, indices, numeric):
+        x = np.array([numeric(i) for i in range(12)], dtype=object)
+        y = np.array([numeric(i) for i in [3, 99, 1, 9, 2, 8, 0, -99, 7, 4, 5, -2]],
+                     dtype=object)
+        x[1], y[1], y[7] = np.inf, -np.inf, np.nan
+        actual = sample(x, y, ratio)
+        np.testing.assert_array_equal(actual[0], x[indices])
+        np.testing.assert_array_equal(actual[1], y[indices])
+
+    @pytest.mark.parametrize("ratio", [1, 4])
+    @pytest.mark.parametrize("value", [
+        10**20, 10**400, Fraction(10**400, 3), Decimal("1e400"),
+    ], ids=["large-int", "huge-int", "huge-fraction", "huge-decimal"])
+    def test_python_single_numeric_object_point(self, ratio, value):
+        x = np.array([value], dtype=object)
+        y = np.array([-value], dtype=object)
+        actual = fpcs_pure.downsample(x, y, ratio)
+        np.testing.assert_array_equal(actual[0], x)
+        np.testing.assert_array_equal(actual[1], y)
+        assert not np.shares_memory(actual[0], x)
+        assert not np.shares_memory(actual[1], y)
+
+    @pytest.mark.parametrize("sample", [fpcs_pure.downsample, _stream_downsample])
+    @pytest.mark.parametrize("ratio,indices", [
+        (1, list(range(8))), (4, [0, 1, 2, 6, 7]), (100, [0, 2, 6, 7]),
+    ])
+    @pytest.mark.parametrize("base", [10**20, 10**400], ids=["large-int", "huge-int"])
+    def test_python_large_integers_preserve_extrema(self, sample, ratio, indices, base):
+        x = [base + i for i in range(8)]
+        y = [base + i for i in [3, 1, 9, 2, 8, 0, -1, 4]]
+        actual = sample(x, y, ratio)
+        assert list(actual[0]) == [x[i] for i in indices]
+        assert list(actual[1]) == [y[i] for i in indices]
+
+    @pytest.mark.parametrize("sample", [fpcs_pure.downsample, _stream_downsample])
+    @pytest.mark.parametrize("ratio", [1, 4])
+    def test_python_decimal_nonfinite_pairs(self, sample, ratio):
+        x = np.array([Decimal(i) for i in range(5)], dtype=object)
+        y = np.array([Decimal(v) for v in ["NaN", "1e400", "Infinity", "-Infinity", "2e400"]],
+                     dtype=object)
+        x_out, y_out = sample(x, y, ratio)
+        np.testing.assert_array_equal(x_out, x[[1, 4]])
+        np.testing.assert_array_equal(y_out, y[[1, 4]])
 
     def test_million_fragmented_samples_have_bounded_finite_output(self):
         y = np.tile([np.nan, 1.0, np.inf, 2.0], 250_000)

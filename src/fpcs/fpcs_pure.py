@@ -7,9 +7,22 @@ This module provides two interfaces for the FPCS algorithm:
 """
 
 from dataclasses import dataclass
+from numbers import Number
 from typing import Iterator
 import numpy as np
 from numpy.typing import ArrayLike
+
+
+def _isfinite_scalar(value) -> bool:
+    """Check numeric scalars without narrowing their precision or range."""
+    try:
+        return np.isfinite(value)
+    except TypeError:
+        if not isinstance(value, Number):
+            raise
+        # NumPy does not handle all Python numbers (e.g. large ints or Decimal).
+        # Comparisons avoid float conversion and its rounding/overflow limits.
+        return value == value and value != np.inf and value != -np.inf
 
 
 @dataclass
@@ -105,7 +118,7 @@ class FPCSDownsampler:
         index = self._index + 1
         self._index = index
         self._counter += 1
-        if not (np.isfinite(x) and np.isfinite(y)):
+        if not (_isfinite_scalar(x) and _isfinite_scalar(y)):
             if self._counter >= self.ratio:
                 if self._window_has_valid:
                     yield from self._process_window()
@@ -251,7 +264,13 @@ def downsample(
         return np.array([]), np.array([])
 
     if len(x) == 1 or ratio == 1:
-        finite = np.isfinite(x) & np.isfinite(y)
+        if x.dtype.hasobject or y.dtype.hasobject:
+            finite = np.fromiter(
+                (_isfinite_scalar(xi) and _isfinite_scalar(yi) for xi, yi in zip(x, y)),
+                dtype=bool, count=len(x),
+            )
+        else:
+            finite = np.isfinite(x) & np.isfinite(y)
         return x[finite].copy(), y[finite].copy()
 
     downsampler = FPCSDownsampler(ratio)
