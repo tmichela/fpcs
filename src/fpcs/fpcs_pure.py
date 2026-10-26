@@ -35,10 +35,10 @@ class FPCSDownsampler:
     Parameters
     ----------
     ratio : int
-        The window size R, counting only points with finite x and y. Must be >= 1.
+        The window size R, counting all original input positions. Must be >= 1.
         Non-finite points are discarded, without gap markers. Each flushed
         segment is bounded by min(n, 2 * ceil(n / R) + 2), including endpoints,
-        where n is its finite point count. Sum these bounds across segments.
+        where n is its input point count. Sum these bounds across segments.
 
     Example
     -------
@@ -63,10 +63,12 @@ class FPCSDownsampler:
         self._index: int = -1
         self._last_retained_index: int = -1
         self._last_point: Point | None = None
+        self._last_point_index: int = -1
         self._clear_window_state()
 
     def _clear_window_state(self):
         """Clear extrema and compensation after a flush."""
+        self._window_has_valid = False
         self._potential_point: Point | None = None
         self._potential_index: int = -1
         self._previous_min_flag: int = -1  # -1: no data, 0: retained max, 1: retained min
@@ -92,19 +94,25 @@ class FPCSDownsampler:
             The x-coordinate (typically time/index).
         y : float
             The y-coordinate (the value). Points with non-finite x or y are
-            discarded before window counting. With ratio=1, all finite points
-            are retained.
+            ignored as extrema candidates but count toward window length.
+            With ratio=1, all finite points are retained.
 
         Yields
         ------
         tuple[float, float]
             Retained points as (x, y) tuples.
         """
-        if not (np.isfinite(x) and np.isfinite(y)):
-            return
-
         index = self._index + 1
         self._index = index
+        self._counter += 1
+        if not (np.isfinite(x) and np.isfinite(y)):
+            if self._counter >= self.ratio:
+                if self._window_has_valid:
+                    yield from self._process_window()
+                else:
+                    self._counter = 0
+            return
+
         if self.ratio == 1:
             yield (x, y)
             return
@@ -113,7 +121,8 @@ class FPCSDownsampler:
         if self._last_point is None:
             yield from self._retain(index, p)
         self._last_point = p
-        self._counter += 1
+        self._last_point_index = index
+        self._window_has_valid = True
 
         if self._max_point is None:
             self._max_point = self._min_point = p
@@ -151,6 +160,7 @@ class FPCSDownsampler:
             self._previous_min_flag = 0
 
         self._counter = 0
+        self._window_has_valid = False
 
     def flush(self) -> Iterator[tuple[float, float]]:
         """
@@ -168,12 +178,13 @@ class FPCSDownsampler:
             Any remaining retained points as (x, y) tuples.
         """
         if self._last_point is None:
+            self._clear_window_state()
             return
-        if self._counter > 0:
+        if self._window_has_valid:
             yield from self._process_window()
         if self._potential_point is not None:
             yield from self._retain(self._potential_index, self._potential_point)
-        yield from self._retain(self._index, self._last_point)
+        yield from self._retain(self._last_point_index, self._last_point)
         self._clear_window_state()
         self._last_point = None
 
@@ -190,9 +201,9 @@ def downsample(
     """
     Downsample a time series using the FPCS algorithm.
 
-    Points with non-finite x or y (NaN or either infinity) are discarded before
-    sampling. Windows count only finite points. The first and last finite points
-    of the series are retained. With ratio=1, all finite points are retained.
+    Points with non-finite x or y (NaN or either infinity) are ignored as extrema
+    candidates. Windows count original input positions, including invalid pairs.
+    The first and last finite points of the series are retained. With ratio=1, all finite points are retained.
     No gap markers are emitted; traces connect across discarded points. All-invalid input
     produces empty arrays.
 
@@ -208,9 +219,9 @@ def downsample(
     y : array-like
         The y-coordinates (e.g., values).
     ratio : int
-        The window size R, counting only finite points. Must be >= 1.
-        Output is bounded by min(n, 2 * ceil(n / R) + 2), where n is the finite
-        point count.
+        The window size R in original input positions. Must be >= 1.
+        Output is bounded by min(n, 2 * ceil(n / R) + 2), where n is the input
+        point count (and output cannot exceed the finite-pair count).
 
     Returns
     -------

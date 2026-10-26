@@ -59,7 +59,7 @@ def _stream_downsample(x, y, ratio):
 
 @pytest.fixture(params=["python", "streaming", "main", "into", "batch"])
 def finite_downsample(request):
-    """Exercise the same finite-only contract through each public entry point."""
+    """Exercise fixed-position windows through each public entry point."""
     if request.param == "python":
         return fpcs_pure.downsample
     if request.param == "streaming":
@@ -602,16 +602,42 @@ class TestNonFiniteHandling:
     @pytest.mark.parametrize("ratio", [1, 2, 4, 100])
     @pytest.mark.parametrize("coordinate", ["x", "y"])
     @pytest.mark.parametrize("invalid", [np.nan, np.inf, -np.inf])
-    def test_invalid_pairs_match_filtered_input(self, finite_downsample, ratio, coordinate, invalid):
+    def test_invalid_pairs_match_python(self, finite_downsample, ratio, coordinate, invalid):
         x = np.arange(19, dtype=np.float64)
         y = np.array([3, 1, 9, 2, 8, 0, 7, 4, 5, -2, 1, 0, 9, 5, 3, 8, 2, 1, 6.])
         (x if coordinate == "x" else y)[[0, 2, 3, 4, 8, 13, 18]] = invalid
-        mask = np.isfinite(x) & np.isfinite(y)
-        expected = fpcs_pure.downsample(x[mask], y[mask], ratio)
+        expected = fpcs_pure.downsample(x, y, ratio)
         actual = finite_downsample(x, y, ratio)
         for result, reference in zip(actual, expected):
             np.testing.assert_array_equal(result, reference)
             assert np.isfinite(result).all()
+
+    @pytest.mark.parametrize("coordinate", ["x", "y"])
+    @pytest.mark.parametrize("invalid", [np.nan, np.inf, -np.inf])
+    def test_invalid_points_do_not_shift_windows(self, finite_downsample, coordinate, invalid):
+        x = np.arange(12, dtype=np.float64)
+        y = np.array([3, 99, 1, 9, 2, 8, 0, -99, 7, 4, 5, -2.])
+        (x if coordinate == "x" else y)[[1, 7]] = invalid
+        x_out, y_out = finite_downsample(x, y, ratio=4)
+        indices = [0, 2, 3, 6, 8, 11]
+        np.testing.assert_array_equal(x_out, x[indices])
+        np.testing.assert_array_equal(y_out, y[indices])
+
+    def test_empty_windows_preserve_compensation(self, finite_downsample):
+        x = np.arange(12, dtype=np.float64)
+        y = np.array([3, 1, 9, 2, np.nan, np.inf, -np.inf, np.nan, 8, 0, 7, 4])
+        x_out, y_out = finite_downsample(x, y, ratio=4)
+        indices = [0, 1, 2, 9, 11]
+        np.testing.assert_array_equal(x_out, x[indices])
+        np.testing.assert_array_equal(y_out, y[indices])
+
+    def test_invalid_edge_windows_keep_finite_endpoints(self, finite_downsample):
+        x = np.arange(12, dtype=np.float64)
+        y = np.array([np.nan] * 4 + [3, 1, 9, 2] + [np.inf] * 4)
+        x_out, y_out = finite_downsample(x, y, ratio=4)
+        indices = [4, 5, 6, 7]
+        np.testing.assert_array_equal(x_out, x[indices])
+        np.testing.assert_array_equal(y_out, y[indices])
 
     @pytest.mark.parametrize("ratio", [1, 3, 100])
     @pytest.mark.parametrize("values", [[], [np.nan], [np.inf], [-np.inf], [np.nan, np.inf, -np.inf]])
@@ -637,10 +663,10 @@ class TestNonFiniteHandling:
             mask = np.isfinite(x) & np.isfinite(y)
             n = np.count_nonzero(mask)
             x_out, y_out = finite_downsample(x, y, ratio)
-            expected = fpcs_pure.downsample(x[mask], y[mask], ratio)
+            expected = fpcs_pure.downsample(x, y, ratio)
             np.testing.assert_array_equal(x_out, expected[0])
             np.testing.assert_array_equal(y_out, expected[1])
-            assert len(x_out) <= min(n, 2 * ((n + ratio - 1) // ratio) + 2)
+            assert len(x_out) <= min(n, 2 * ((size + ratio - 1) // ratio) + 2)
             assert np.all(np.diff(x_out) > 0)
             if n:
                 assert x_out[0] == x[mask][0]
@@ -651,9 +677,8 @@ class TestNonFiniteHandling:
         x = np.zeros(18)[::-2]
         y = np.array([np.nan, 4, 3, np.inf, 1, 9, -np.inf, 2, np.nan])[::-1]
         x.flags.writeable = y.flags.writeable = False
-        mask = np.isfinite(x) & np.isfinite(y)
         actual = finite_downsample(x, y, ratio)
-        expected = fpcs_pure.downsample(x[mask], y[mask], ratio)
+        expected = fpcs_pure.downsample(x, y, ratio)
         np.testing.assert_array_equal(actual, expected)
 
     @pytest.mark.parametrize("sample", [fpcs_pure.downsample, _stream_downsample])
@@ -673,8 +698,7 @@ class TestNonFiniteHandling:
         x = np.arange(len(y), dtype=np.float64)
         ratio = max(1, int(len(y) / (0.8 * 150)))
         x_out, y_out = downsample(x, y, ratio)
-        n = np.count_nonzero(np.isfinite(y))
-        assert len(x_out) <= 2 * ((n + ratio - 1) // ratio) + 2
+        assert len(x_out) <= 2 * ((len(y) + ratio - 1) // ratio) + 2
         assert x_out[0] == 1
         assert x_out[-1] == len(y) - 1
         assert np.isfinite(y_out).all()

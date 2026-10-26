@@ -81,15 +81,17 @@ x_ds, y_ds = downsample(x, y, ratio=100)
 print(f"Original: {len(x)} points | Downsampled: {len(x_ds)} points")
 ```
 
-Points with `NaN`, `+Inf`, or `-Inf` in either coordinate are discarded before
-sampling. Windows span `ratio` finite points; missing values do not count toward
-window length or reset compensation. The first and last finite points are
+Windows span `ratio` original input positions. Points with `NaN`, `+Inf`, or
+`-Inf` in either coordinate are ignored when choosing extrema, but still count
+toward window length. Entirely invalid windows emit nothing and preserve
+compensation state. The first and last finite points are
 retained. With `ratio=1`, all finite pairs are returned. An entirely non-finite
 input produces empty arrays. No gap markers are emitted, so traces connect
 across discarded points using their original x coordinates.
 
-Output size is at most `min(n, 2 * ceil(n / ratio) + 2)`, where `n` is the number
-of finite coordinate pairs (using `len(x)` is also a safe bound).
+Output size is at most `min(n, 2 * ceil(n / ratio) + 2)`, where `n = len(x)`
+is the number of original input positions. Output also cannot exceed the number
+of finite coordinate pairs.
 The ratio controls window size rather than an exact output count. For a
 conservative budget of `target >= 4` points, use
 `ratio = max(1, math.ceil(n / ((target - 2) // 2)))` (after `import math`).
@@ -115,7 +117,7 @@ for rx, ry in downsampler.flush():
 To match batch processing with the same input precision, flush only at the end.
 Each flush finishes a segment and resets window and compensation state.
 The bound `min(n, 2 * ceil(n / ratio) + 2)` applies separately to each segment,
-where `n` counts finite pairs since the previous flush (or stream start). Across
+where `n` counts all input positions since the previous flush (or stream start). Across
 multiple segments, sum their individual bounds. Frequent flushing changes
 compression.
 
@@ -131,8 +133,8 @@ The main entry point for batch processing.
     - `(np.ndarray, np.ndarray)`: A tuple of `(x_downsampled, y_downsampled)`.
 - **Notes:**
     - The first and last finite points are retained.
-    - Points with non-finite x or y are discarded before window counting.
-    - Output is bounded by `min(n, 2 * ceil(n / ratio) + 2)` for n finite pairs.
+    - Non-finite pairs are ignored as extrema candidates and count toward window length.
+    - Output is bounded by `min(n, 2 * ceil(n / ratio) + 2)` for `n = len(x)` input positions.
     - `ratio=1` retains every finite point.
     - Integer inputs are supported; all Cython batch APIs convert them to float64.
       Integers outside `[-2**53, 2**53]` may round, losing exact values.
@@ -153,7 +155,7 @@ Initialize the downsampler.
 Add a single point to the downsampler.
 - **Yields:** Tuples of `(x, y)` for any points retained during this step.
 - **Notes:**
-    - Streaming uses the same finite-only windows as batch processing.
+    - Streaming uses the same fixed input-position windows as batch processing.
     - Call `flush()` to emit remaining points at the end of the stream.
     - Non-finite pairs are discarded; `ratio=1` retains every finite point.
 
@@ -203,27 +205,29 @@ float64 points from `TestBenchmarks.benchmark_data` in `test_fpcs.py` (seed 42).
 The algorithm comparison uses `ratio=100` for FPCS and 12,500 output points
 for LTTB; the ratio-scaling table uses each listed ratio.
 
-Measured on Linux with Python 3.11.13, NumPy 1.26.4, Cython 3.1.2, and
-LTTBC 0.2.4, after warmup with at least 20 measured rounds per case, pinned
-to one CPU. All time columns are in milliseconds; OPS is calls per second.
-Timings vary with hardware and host load.
+Measured on Linux with Python 3.13.15, NumPy 2.4.1, Cython 3.2.4, and
+LTTBC 0.3.0, using the current Cython source build. Each case had two warmup
+calls followed by 25 measured calls, pinned to CPU 0, with case order reversed
+on alternating rounds. All time columns are in milliseconds; StdDev is the
+sample standard deviation and OPS is calls per second. Timings vary with
+hardware and host load.
 
 **Algorithm comparison**
 
 | Name (time in ms) | Min | Max | Mean | StdDev | OPS |
 |:---|---:|---:|---:|---:|---:|
-| **Cython FPCS** | 1.4334 | 2.5953 | 1.4537 | 0.1106 | 687.9136 |
-| **LTTB (C impl)** | 2.4700 | 2.9949 | 2.4894 | 0.0400 | 401.7101 |
-| **Pure Python** | 448.6423 | 463.1361 | 453.8052 | 3.3927 | 2.2036 |
+| **Cython FPCS** | 3.2423 | 3.3360 | 3.2970 | 0.0238 | 303.3039 |
+| **LTTB (C impl)** | 4.7231 | 4.8792 | 4.7839 | 0.0498 | 209.0329 |
+| **Pure Python** | 2781.4097 | 2809.4537 | 2791.8646 | 7.7652 | 0.3582 |
 
 **Ratio scaling (Cython)**
 
 | Ratio | Mean Time (ms) | StdDev |
 |:---|---:|---:|
-| **10** | 3.66 | 0.04 |
-| **50** | 1.85 | 0.10 |
-| **100** | 1.46 | 0.13 |
-| **500** | 1.05 | 0.01 |
+| **10** | 6.89 | 0.06 |
+| **50** | 3.82 | 0.02 |
+| **100** | 3.26 | 0.03 |
+| **500** | 2.72 | 0.02 |
 
 ## License
 This project is licensed under the MIT Licence - see the LICENSE file for details.
