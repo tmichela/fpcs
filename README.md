@@ -32,8 +32,7 @@ whereas LTTB may miss sharp spikes in noisy datasets, as illustrated below.
 - **Streaming data:** Supports incremental processing via `FPCSDownsampler`.
 - **Feature preserving:** Selects window extrema with compensation for
   features that would otherwise be lost between windows.
-- **Robust:** Ignores `NaN` samples in mixed windows, marks missing windows,
-  and treats `±Inf` as extrema.
+- **Robust:** Discards points with `NaN` or infinite coordinates.
 - **Batched processing:** Efficiently downsample multiple series at once.
 
 ---
@@ -82,23 +81,15 @@ x_ds, y_ds = downsample(x, y, ratio=100)
 print(f"Original: {len(x)} points | Downsampled: {len(x_ds)} points")
 ```
 
-For `ratio > 1`, fixed windows span `ratio` consecutive input samples,
-including `NaN`s. Windows containing non-NaN samples ignore NaNs when selecting
-extrema using FPCS compensation. An all-NaN window, including a partial final
-window, retains its first NaN as a gap marker. Any pending extremum is emitted
-before that marker, and compensation resets. `±Inf` values remain valid extrema.
-The first and last input samples are always retained, even if they are NaN.
-Gaps inside mixed windows are deliberately hidden, connecting across missing
-samples. With `ratio=1`, every input point is retained.
+Points with `NaN`, `+Inf`, or `-Inf` in either coordinate are discarded before
+sampling. Windows span `ratio` finite points; missing values do not count toward
+window length or reset compensation. The first and last finite points are
+retained. With `ratio=1`, all finite pairs are returned. An entirely non-finite
+input produces empty arrays. No gap markers are emitted, so traces connect
+across discarded points using their original x coordinates.
 
-Depending on window alignment, an interior gap of up to `2 * ratio - 2`
-consecutive NaNs can disappear entirely. Windows count samples, not elapsed
-time, so a hidden gap can span arbitrarily long intervals with irregular
-timestamps. To preserve gaps in a line plot, downsample contiguous non-NaN
-runs separately and retain NaN separators between them. The output bound
-then applies to each run separately; the total also includes the separators.
-
-Output size is at most `min(n, 2 * ceil(n / ratio) + 2)`, where `n = len(x)`.
+Output size is at most `min(n, 2 * ceil(n / ratio) + 2)`, where `n` is the number
+of finite coordinate pairs (using `len(x)` is also a safe bound).
 The ratio controls window size rather than an exact output count. For a
 conservative budget of `target >= 4` points, use
 `ratio = max(1, math.ceil(n / ((target - 2) // 2)))` (after `import math`).
@@ -124,9 +115,9 @@ for rx, ry in downsampler.flush():
 To match batch processing with the same input precision, flush only at the end.
 Each flush finishes a segment and resets window and compensation state.
 The bound `min(n, 2 * ceil(n / ratio) + 2)` applies separately to each segment,
-where `n` counts samples since the previous flush (or stream start). Across
+where `n` counts finite pairs since the previous flush (or stream start). Across
 multiple segments, sum their individual bounds. Frequent flushing changes
-compression and can change gap visibility.
+compression.
 
 ## API Reference
 
@@ -139,12 +130,10 @@ The main entry point for batch processing.
 - **Returns:**
     - `(np.ndarray, np.ndarray)`: A tuple of `(x_downsampled, y_downsampled)`.
 - **Notes:**
-    - The first and last input points are retained, even if NaN.
-    - Windows count all input samples, including NaNs. Mixed windows ignore
-      NaNs; all-NaN windows retain their first sample and reset compensation.
-    - Output is bounded by `min(n, 2 * ceil(n / ratio) + 2)`.
-    - `ratio=1` retains every input sample, including every `NaN`.
-    - `±Inf` values are treated as extrema.
+    - The first and last finite points are retained.
+    - Points with non-finite x or y are discarded before window counting.
+    - Output is bounded by `min(n, 2 * ceil(n / ratio) + 2)` for n finite pairs.
+    - `ratio=1` retains every finite point.
     - Integer inputs are supported; all Cython batch APIs convert them to float64.
       Integers outside `[-2**53, 2**53]` may round, losing exact values.
       Python batch and streaming retain integer comparisons, so selected extrema
@@ -164,9 +153,9 @@ Initialize the downsampler.
 Add a single point to the downsampler.
 - **Yields:** Tuples of `(x, y)` for any points retained during this step.
 - **Notes:**
-    - Streaming uses the same fixed windows and NaN rules as batch processing.
+    - Streaming uses the same finite-only windows as batch processing.
     - Call `flush()` to emit remaining points at the end of the stream.
-    - `±Inf` values are treated as extrema; `ratio=1` retains every point.
+    - Non-finite pairs are discarded; `ratio=1` retains every finite point.
 
 #### `flush() -> Iterator[tuple[float, float]]`
 Flush any remaining points from the internal buffer (e.g., at the end of a

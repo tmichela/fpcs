@@ -58,8 +58,8 @@ def _stream_downsample(x, y, ratio):
 
 
 @pytest.fixture(params=["python", "streaming", "main", "into", "batch"])
-def gap_downsample(request):
-    """Exercise the same gap contract through each public entry point."""
+def finite_downsample(request):
+    """Exercise the same finite-only contract through each public entry point."""
     if request.param == "python":
         return fpcs_pure.downsample
     if request.param == "streaming":
@@ -237,7 +237,7 @@ class TestPythonStreaming:
             retained.extend(downsampler.add(xi, yi))
         retained.extend(downsampler.flush())
         expected_x, expected_y = _stream_downsample(x, y, ratio=4)
-        actual_x, actual_y = np.asarray(retained).T
+        actual_x, actual_y = np.asarray(retained).reshape(-1, 2).T
         np.testing.assert_array_equal(actual_x, expected_x)
         np.testing.assert_array_equal(actual_y, expected_y)
 
@@ -254,7 +254,7 @@ class TestPythonStreaming:
         retained.extend(downsampler.flush())
         assert list(downsampler.flush()) == []
         expected_x, expected_y = fpcs_pure.downsample(np.arange(len(values)), values, 4)
-        actual_x, actual_y = np.asarray(retained).T
+        actual_x, actual_y = np.asarray(retained).reshape(-1, 2).T
         np.testing.assert_array_equal(actual_x, expected_x)
         np.testing.assert_array_equal(actual_y, expected_y)
 
@@ -276,8 +276,8 @@ class TestPythonStreaming:
         for i, yi in enumerate(values, start=len(prefix)):
             retained.extend(downsampler.add(float(i), yi))
         retained.extend(downsampler.flush())
-        indices = np.array([0, 2, 3, 4, 5])
-        actual_x, actual_y = np.asarray(retained).T
+        indices = np.array([1, 2, 3, 4])
+        actual_x, actual_y = np.asarray(retained).reshape(-1, 2).T
         np.testing.assert_array_equal(actual_x, indices + len(prefix))
         np.testing.assert_array_equal(actual_y, np.asarray(values)[indices])
 
@@ -598,203 +598,86 @@ class TestEdgeCases:
 # NaN and Inf Handling Tests
 # =============================================================================
 
-class TestNaNHandling:
-    """Tests for NaN value handling."""
+class TestNonFiniteHandling:
+    @pytest.mark.parametrize("ratio", [1, 2, 4, 100])
+    @pytest.mark.parametrize("coordinate", ["x", "y"])
+    @pytest.mark.parametrize("invalid", [np.nan, np.inf, -np.inf])
+    def test_invalid_pairs_match_filtered_input(self, finite_downsample, ratio, coordinate, invalid):
+        x = np.arange(19, dtype=np.float64)
+        y = np.array([3, 1, 9, 2, 8, 0, 7, 4, 5, -2, 1, 0, 9, 5, 3, 8, 2, 1, 6.])
+        (x if coordinate == "x" else y)[[0, 2, 3, 4, 8, 13, 18]] = invalid
+        mask = np.isfinite(x) & np.isfinite(y)
+        expected = fpcs_pure.downsample(x[mask], y[mask], ratio)
+        actual = finite_downsample(x, y, ratio)
+        for result, reference in zip(actual, expected):
+            np.testing.assert_array_equal(result, reference)
+            assert np.isfinite(result).all()
 
-    def test_nans_in_mixed_windows_are_ignored(self):
-        """Valid samples hide missing samples within the same window."""
-        x = np.arange(20, dtype=np.float64)
-        y = np.sin(x * 0.5)
-        y[5] = np.nan
-        y[12] = np.nan
-
-        x_out, y_out = downsample(x, y, ratio=5)
-
-        assert not np.any(np.isnan(y_out))
-
-    def test_nan_at_start(self):
-        """NaN at start of data should be handled."""
-        x = np.arange(20, dtype=np.float64)
-        y = np.sin(x * 0.5)
-        y[0] = np.nan
-
-        x_out, y_out = downsample(x, y, ratio=5)
-
-        # First point is always retained, NaN should be preserved
-        assert np.isnan(y_out).sum() >= 1
-
-    def test_nan_at_end(self):
-        """NaN at end of data should be handled."""
-        x = np.arange(20, dtype=np.float64)
-        y = np.sin(x * 0.5)
-        y[-1] = np.nan
-
-        x_out, y_out = downsample(x, y, ratio=5)
-
-        # Last point is always retained
-        assert np.isnan(y_out[-1])
-
-    def test_all_nan(self):
-        """All NaN data should return all NaN."""
-        x = np.arange(10, dtype=np.float64)
-        y = np.full(10, np.nan)
-
-        x_out, y_out = downsample(x, y, ratio=5)
-
-        assert np.all(np.isnan(y_out))
-
-    def test_python_cython_nan_equivalence(self):
-        """Python and Cython should handle NaN identically."""
-        x = np.arange(50, dtype=np.float64)
-        y = np.sin(x * 0.2)
-        y[10] = np.nan
-        y[25] = np.nan
-        y[40] = np.nan
-
-        x_py, y_py = fpcs_pure.downsample(x, y, ratio=10)
-        x_main, y_main = downsample(x, y, ratio=10)
-
-        # Check same number of NaN values
-        assert np.isnan(y_py).sum() == np.isnan(y_main).sum()
-
-
-class TestGapCompression:
-    @pytest.mark.parametrize("values,ratio,indices", [
-        pytest.param(np.full(1000, np.nan), 10, [*range(0, 1000, 10), 999], id="all-nan"),
-        pytest.param(
-            np.r_[np.full(9, np.nan), 7, np.full(990, np.nan)],
-            10, [0, 9, *range(10, 1000, 10), 999], id="isolated-valid-point",
-        ),
-        pytest.param([np.nan], 10, [0], id="single-nan"),
-        pytest.param([np.nan, np.nan], 10, [0, 1], id="two-nans"),
-        pytest.param([np.nan] * 5 + [7] + [np.nan] * 5, 100, [0, 5, 10], id="singleton-valid"),
-        pytest.param([3, 1, 9, 2], 100, [0, 1, 2, 3], id="finite-terminal-extrema"),
-        pytest.param([3, 9, 1, 2], 100, [0, 1, 2, 3], id="max-before-min"),
-        pytest.param([5, 5, 5, 5], 100, [0, 3], id="constant-finite-run"),
-        pytest.param([np.nan, 5, np.nan, 5, np.nan], 100, [0, 1, 3, 4], id="mixed-flat"),
-        pytest.param([np.nan, 1, np.nan, 2, 3, np.nan], 100, [0, 1, 4, 5], id="mixed-monotone"),
-        pytest.param([3, 1, 9, np.nan, 2, 8, 0, 7], 4, [0, 1, 2, 6, 7], id="nan-counts-toward-boundary"),
-        pytest.param([3, 1, np.nan, np.nan, np.nan, np.nan, 9, 2], 4, [0, 1, 6, 7], id="gap-straddles-mixed-windows"),
-        pytest.param(
-            [3, 1, 9, 2, np.nan, np.nan, np.nan], 4,
-            [0, 1, 2, 4, 6], id="all-nan-partial-window",
-        ),
-        pytest.param(
-            [3, 1, 9, 2] + [np.nan] * 4 + [5, -4, 8, 6],
-            4, [0, 1, 2, 4, 9, 10, 11], id="gap-flushes-compensation",
-        ),
-        pytest.param(
-            [3, 1, 9, 2] + [np.nan] * 4 + [5, -4, 8, 6],
-            100, [0, 2, 9, 11], id="two-islands-in-one-window",
-        ),
-        pytest.param(
-            [3, 1, 9, 2] + [np.nan] * 6,
-            4, [0, 1, 2, 4, 8, 9], id="all-nan-full-and-partial-windows",
-        ),
-        pytest.param(
-            [4, 3, 1, 5, 9, 6, 2] + [np.nan] * 4 + [7],
-            100, [0, 2, 4, 11], id="island-endpoints-are-not-retained",
-        ),
-        pytest.param(
-            [np.nan, 3, 1, 9, 2, np.nan], 100, [0, 2, 3, 5], id="global-nan-endpoints",
-        ),
-        pytest.param(
-            [np.nan, 1, np.nan, 3, np.nan, 2, np.nan],
-            100, [0, 1, 3, 6], id="fragmented-gaps",
-        ),
-        pytest.param(
-            [np.nan, 0, np.inf, -np.inf, 1, np.nan, np.nan],
-            100, [0, 2, 3, 6], id="infinities-are-valid",
-        ),
-    ])
-    def test_fixed_windows_retain_extrema_and_all_nan_markers(self, gap_downsample, values, ratio, indices):
-        y = np.asarray(values, dtype=np.float64)
-        x = np.arange(len(y), dtype=np.float64)
-        x_out, y_out = gap_downsample(x, y, ratio)
-        np.testing.assert_array_equal(x_out, x[indices])
-        np.testing.assert_array_equal(y_out, y[indices])
-
-    @pytest.mark.parametrize("values", [
-        [], [np.nan] * 20, [np.nan, 3, 1, np.nan, 9, np.nan, np.nan], [3, 1, 9, 2],
-    ])
-    def test_ratio_one_is_identity(self, gap_downsample, values):
-        y = np.asarray(values, dtype=np.float64)
-        x = np.zeros(len(y), dtype=np.float64)
-        x_out, y_out = gap_downsample(x, y, 1)
-        np.testing.assert_array_equal(x_out, x)
-        np.testing.assert_array_equal(y_out, y)
+    @pytest.mark.parametrize("ratio", [1, 3, 100])
+    @pytest.mark.parametrize("values", [[], [np.nan], [np.inf], [-np.inf], [np.nan, np.inf, -np.inf]])
+    def test_no_finite_points(self, finite_downsample, ratio, values):
+        x_out, y_out = finite_downsample(np.arange(len(values)), values, ratio)
+        assert len(x_out) == len(y_out) == 0
 
     @pytest.mark.parametrize("ratio", [1, 4, 100])
-    def test_readonly_inputs(self, gap_downsample, ratio):
-        y = np.array([np.nan, np.nan, 3, 1, 9, 2, np.nan, np.nan, 5, 8, -4, 6, np.nan])
-        x = np.arange(len(y), dtype=np.float64)
-        x.flags.writeable = False
-        y.flags.writeable = False
-        expected_x, expected_y = fpcs_pure.downsample(x, y, ratio)
-        x_out, y_out = gap_downsample(x, y, ratio)
-        np.testing.assert_array_equal(x_out, expected_x)
-        np.testing.assert_array_equal(y_out, expected_y)
+    def test_one_finite_point(self, finite_downsample, ratio):
+        x_out, y_out = finite_downsample([0, 1, 2, 3], [np.nan, 7, np.inf, -np.inf], ratio)
+        np.testing.assert_array_equal(x_out, [1])
+        np.testing.assert_array_equal(y_out, [7])
 
-    @pytest.mark.parametrize("values,indices", [
-        (
-            [3, 1, 9, 2] + [np.nan] * 4 + [5, 8, -4, 6] + [np.nan] * 3,
-            [0, 1, 2, 4, 9, 10, 12, 14],
-        ),
-        ([5] * 4 + [np.nan] * 4 + [5] * 3, [0, 3, 4, 8, 10]),
-    ])
-    def test_repeated_timestamps_preserve_source_order(self, gap_downsample, values, indices):
-        y = np.asarray(values, dtype=np.float64)
-        x = np.zeros(len(y), dtype=np.float64)
-        x_out, y_out = gap_downsample(x, y, 4)
+    @pytest.mark.parametrize("ratio", [1, 2, 9, 100, 1000])
+    def test_sparse_order_bound_and_parity(self, finite_downsample, ratio):
+        rng = np.random.default_rng(731)
+        for size in [0, 1, 2, 17, 300]:
+            x = np.arange(size, dtype=np.float64)
+            y = rng.standard_normal(size)
+            y[rng.random(size) < 0.4] = np.nan
+            y[rng.random(size) < 0.2] = np.inf
+            x[rng.random(size) < 0.2] = -np.inf
+            mask = np.isfinite(x) & np.isfinite(y)
+            n = np.count_nonzero(mask)
+            x_out, y_out = finite_downsample(x, y, ratio)
+            expected = fpcs_pure.downsample(x[mask], y[mask], ratio)
+            np.testing.assert_array_equal(x_out, expected[0])
+            np.testing.assert_array_equal(y_out, expected[1])
+            assert len(x_out) <= min(n, 2 * ((n + ratio - 1) // ratio) + 2)
+            assert np.all(np.diff(x_out) > 0)
+            if n:
+                assert x_out[0] == x[mask][0]
+                assert x_out[-1] == x[mask][-1]
+
+    @pytest.mark.parametrize("ratio", [1, 4, 100])
+    def test_readonly_strided_repeated_timestamps(self, finite_downsample, ratio):
+        x = np.zeros(18)[::-2]
+        y = np.array([np.nan, 4, 3, np.inf, 1, 9, -np.inf, 2, np.nan])[::-1]
+        x.flags.writeable = y.flags.writeable = False
+        mask = np.isfinite(x) & np.isfinite(y)
+        actual = finite_downsample(x, y, ratio)
+        expected = fpcs_pure.downsample(x[mask], y[mask], ratio)
+        np.testing.assert_array_equal(actual, expected)
+
+    @pytest.mark.parametrize("sample", [fpcs_pure.downsample, _stream_downsample])
+    @pytest.mark.parametrize("ratio", [1, 2, 10])
+    def test_python_preserves_extended_precision_finite_points(self, sample, ratio):
+        if np.finfo(np.longdouble).max <= np.finfo(np.float64).max:
+            pytest.skip("longdouble has no extended range on this platform")
+        x = np.arange(3, dtype=np.longdouble)
+        y = np.array(["1e400", "2e400", "3e400"], dtype=np.longdouble)
+        x_out, y_out = sample(x, y, ratio)
+        indices = [0, 2] if ratio > len(x) else [0, 1, 2]
         np.testing.assert_array_equal(x_out, x[indices])
         np.testing.assert_array_equal(y_out, y[indices])
 
-    def test_inserting_nans_shifts_window_boundaries(self, gap_downsample):
-        values = np.array([3, 1, 9, 2, 8, 0, 7, 4], dtype=np.float64)
-        x_out, _ = gap_downsample(np.arange(len(values)), values, 4)
-        np.testing.assert_array_equal(x_out, [0, 1, 2, 5, 7])
-        y = np.r_[np.nan, np.nan, values]
-        x_out, y_out = gap_downsample(np.arange(len(y)), y, 4)
-        indices = [0, 2, 3, 4, 7, 8, 9]
-        np.testing.assert_array_equal(x_out, indices)
-        np.testing.assert_array_equal(y_out, y[indices])
-
-    @pytest.mark.parametrize("ratio", [1, 2, 9, 100, 1000])
-    def test_random_sparse_output_bound_source_order_and_parity(self, gap_downsample, ratio):
-        rng = np.random.default_rng(731)
-        for size in [0, 1, 2, 17, 300]:
-            y = rng.standard_normal(size)
-            y[rng.random(size) < 0.92] = np.nan
-            y[100:150] = rng.standard_normal(len(y[100:150]))
-            x = np.arange(size, dtype=np.float64)
-            x_out, y_out = gap_downsample(x, y, ratio)
-            indices = x_out.astype(np.intp)
-            assert np.all(np.diff(indices) > 0)
-            assert len(indices) <= min(size, 2 * ((size + ratio - 1) // ratio) + 2)
-            np.testing.assert_array_equal(x_out, x[indices])
-            np.testing.assert_array_equal(y_out, y[indices])
-            if size:
-                assert indices[0] == 0
-                assert indices[-1] == size - 1
-
-            markers = {start for start in range(0, size, ratio)
-                       if np.all(np.isnan(y[start:start + ratio]))}
-            markers.update(index for index in [0, size - 1]
-                           if size and np.isnan(y[index]))
-            assert set(indices[np.isnan(y_out)]) == markers
-            expected_x, expected_y = fpcs_pure.downsample(x, y, ratio)
-            np.testing.assert_array_equal(x_out, expected_x)
-            np.testing.assert_array_equal(y_out, expected_y)
-
-    def test_million_fragmented_samples_have_window_bounded_output(self):
-        y = np.tile([np.nan, 1.0, np.nan, 2.0], 250_000)
+    def test_million_fragmented_samples_have_bounded_finite_output(self):
+        y = np.tile([np.nan, 1.0, np.inf, 2.0], 250_000)
         x = np.arange(len(y), dtype=np.float64)
         ratio = max(1, int(len(y) / (0.8 * 150)))
         x_out, y_out = downsample(x, y, ratio)
-        assert len(x_out) <= 2 * ((len(y) + ratio - 1) // ratio) + 2
-        assert x_out[0] == 0
+        n = np.count_nonzero(np.isfinite(y))
+        assert len(x_out) <= 2 * ((n + ratio - 1) // ratio) + 2
+        assert x_out[0] == 1
         assert x_out[-1] == len(y) - 1
-        assert np.isnan(y_out).sum() == 1
+        assert np.isfinite(y_out).all()
         np.testing.assert_array_equal(y_out, y[x_out.astype(np.intp)])
 
 
@@ -877,53 +760,3 @@ class TestOutputBufferOverlap:
         np.testing.assert_array_equal(out_y[:count], expected_y)
         np.testing.assert_array_equal(x, np.arange(12)[::input_step])
         np.testing.assert_array_equal(y, (np.arange(12) ** 2)[::input_step])
-
-
-class TestInfHandling:
-    """Tests for Inf value handling."""
-
-    def test_positive_inf_retained(self):
-        """+Inf should be retained as maximum."""
-        x = np.arange(20, dtype=np.float64)
-        y = np.sin(x * 0.5)
-        y[7] = np.inf
-
-        x_out, y_out = downsample(x, y, ratio=10)
-
-        assert np.any(np.isinf(y_out) & (y_out > 0)), "+Inf not found in output"
-
-    def test_negative_inf_retained(self):
-        """-Inf should be retained as minimum."""
-        x = np.arange(20, dtype=np.float64)
-        y = np.sin(x * 0.5)
-        y[7] = -np.inf
-
-        x_out, y_out = downsample(x, y, ratio=10)
-
-        assert np.any(np.isinf(y_out) & (y_out < 0)), "-Inf not found in output"
-
-    def test_both_inf_in_window(self):
-        """Both +Inf and -Inf in same window."""
-        x = np.arange(20, dtype=np.float64)
-        y = np.zeros(20)
-        y[2] = np.inf
-        y[4] = -np.inf
-
-        x_out, y_out = downsample(x, y, ratio=10)
-
-        # Both should be retained as they are the extrema
-        assert np.any(y_out == np.inf), "+Inf not found"
-        assert np.any(y_out == -np.inf), "-Inf not found"
-
-    def test_python_cython_inf_equivalence(self):
-        """Python and Cython should handle Inf identically."""
-        x = np.arange(50, dtype=np.float64)
-        y = np.sin(x * 0.2)
-        y[15] = np.inf
-        y[35] = -np.inf
-
-        x_py, y_py = fpcs_pure.downsample(x, y, ratio=10)
-        x_main, y_main = downsample(x, y, ratio=10)
-
-        # Check same Inf positions
-        assert np.isinf(y_py).sum() == np.isinf(y_main).sum()
