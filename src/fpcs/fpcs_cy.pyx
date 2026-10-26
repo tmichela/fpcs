@@ -90,9 +90,9 @@ def downsample(
     """
     Downsample a time series using the FPCS algorithm (Cython implementation).
 
-    Points with non-finite x or y (NaN or either infinity) are discarded before
-    sampling. Windows count only finite points. The first and last finite points
-    of the series are retained. With ratio=1, all finite points are retained.
+    Points with non-finite x or y (NaN or either infinity) are ignored as extrema
+    candidates. Windows count original input positions, including invalid pairs.
+    The first and last finite points of the series are retained. With ratio=1, all finite points are retained.
     No gap markers are emitted; traces connect across discarded points. All-invalid input
     produces empty arrays.
 
@@ -108,9 +108,9 @@ def downsample(
     y : array-like
         The y-coordinates (e.g., values). Integer inputs are supported.
     ratio : int
-        The window size R, counting only finite points. Must be >= 1.
-        Output is bounded by min(n, 2 * ceil(n / R) + 2), where n is the finite
-        point count.
+        The window size R in original input positions. Must be >= 1.
+        Output is bounded by min(n, 2 * ceil(n / R) + 2), where n is the input
+        point count (and output cannot exceed the finite-pair count).
 
     Returns
     -------
@@ -173,60 +173,68 @@ cdef inline Py_ssize_t _downsample_core_ptr(
     double* out_x,
     double* out_y,
 ) noexcept nogil:
-    """Downsample the finite coordinate pairs without allocating a filtered copy."""
+    """Scan fixed input windows, ignoring non-finite extrema candidates."""
     cdef:
         Py_ssize_t min_idx = -1
         Py_ssize_t max_idx = -1
         Py_ssize_t potential_idx = -1
         Py_ssize_t last_retained = -1
-        Py_ssize_t last_valid = -1
         Py_ssize_t out_idx = 0
-        Py_ssize_t i
+        Py_ssize_t i, start, end, first = 0, last = n - 1
         double py
         double min_y = 0, max_y = 0
         int previous_min_flag = -1
-        int counter = 0
+        bint has_valid
 
-    for i in range(n):
-        py = y[i]
-        if not (isfinite(x[i]) and isfinite(py)):
-            continue
-        if ratio == 1:
-            _retain_index(x, y, i, out_x, out_y, &out_idx, &last_retained)
-            continue
-        if last_valid < 0:
-            _retain_index(x, y, i, out_x, out_y, &out_idx, &last_retained)
-        last_valid = i
-        counter += 1
-        if min_idx < 0:
-            min_idx = max_idx = i
-            min_y = max_y = py
-        elif py >= max_y:
-            max_idx = i
-            max_y = py
-        elif py < min_y:
-            min_idx = i
-            min_y = py
+    if ratio == 1:
+        for i in range(n):
+            if isfinite(x[i]) and isfinite(y[i]):
+                out_x[out_idx] = x[i]
+                out_y[out_idx] = y[i]
+                out_idx += 1
+        return out_idx
 
-        if counter == ratio:
+    while first < n and not (isfinite(x[first]) and isfinite(y[first])):
+        first += 1
+    if first == n:
+        return 0
+    while not (isfinite(x[last]) and isfinite(y[last])):
+        last -= 1
+    _retain_index(x, y, first, out_x, out_y, &out_idx, &last_retained)
+
+    start = (first // ratio) * ratio
+    while start <= last:
+        end = start + ratio
+        if end > last + 1:
+            end = last + 1
+        has_valid = False
+        for i in range(start, end):
+            py = y[i]
+            if not (isfinite(x[i]) and isfinite(py)):
+                continue
+            has_valid = True
+            if min_idx < 0:
+                min_idx = max_idx = i
+                min_y = max_y = py
+            elif py >= max_y:
+                max_idx = i
+                max_y = py
+            elif py < min_y:
+                min_idx = i
+                min_y = py
+
+        if has_valid:
             _process_window_state(
                 x, y, &min_idx, &max_idx, &potential_idx, &previous_min_flag,
                 out_x, out_y, &out_idx, &last_retained,
             )
             min_y = y[min_idx]
             max_y = y[max_idx]
-            counter = 0
+        start = end
 
-    if counter > 0:
-        _process_window_state(
-            x, y, &min_idx, &max_idx, &potential_idx, &previous_min_flag,
-            out_x, out_y, &out_idx, &last_retained,
-        )
     if potential_idx >= 0:
         _retain_index(x, y, potential_idx, out_x, out_y, &out_idx, &last_retained)
-    if last_valid >= 0:
-        _retain_index(x, y, last_valid, out_x, out_y, &out_idx, &last_retained)
-
+    _retain_index(x, y, last, out_x, out_y, &out_idx, &last_retained)
     return out_idx
 
 
@@ -324,7 +332,7 @@ def downsample_batch(
 
     More efficient than calling downsample() in a loop due to reduced
     Python overhead.
-    Each series follows downsample(), including finite-only sampling and
+    Each series follows downsample(), including fixed-position windows and
     float64 integer precision limits.
 
     Parameters
