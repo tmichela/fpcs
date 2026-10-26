@@ -23,7 +23,7 @@ Optimizations applied:
 cimport cython
 from libc.stdlib cimport malloc, free
 from libc.string cimport memcpy
-from libc.math cimport isnan
+from libc.math cimport isfinite
 from cpython.mem cimport PyMem_Malloc, PyMem_Free
 import numpy as np
 cimport numpy as np
@@ -50,12 +50,6 @@ cdef tuple _downsample_float64(
 
     if n == 0:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
-
-    if n == 1:
-        return np.asarray(x).copy(), np.asarray(y).copy()
-
-    if ratio == 1:
-        return np.asarray(x).copy(), np.asarray(y).copy()
 
     cdef Py_ssize_t capacity = _output_capacity(n, ratio)
     cdef double* out_x = <double*>malloc(capacity * sizeof(double))
@@ -96,15 +90,12 @@ def downsample(
     """
     Downsample a time series using the FPCS algorithm (Cython implementation).
 
-    Fixed windows count all input samples. Mixed windows ignore NaNs when
-    selecting extrema; all-NaN windows retain one gap marker and reset
-    compensation. Global endpoints are retained, even if NaN. With ratio=1,
-    all points are retained.
+    Points with non-finite x or y (NaN or either infinity) are discarded before
+    sampling. Windows count only finite points. The first and last finite points
+    of the series are retained. With ratio=1, all finite points are retained.
+    No gap markers are emitted; traces connect across discarded points. All-invalid input
+    produces empty arrays.
 
-    An interior gap of up to 2 * ratio - 2 NaNs can disappear, depending on
-    window alignment. Windows count samples, not elapsed time. To preserve
-    visible gaps, downsample contiguous non-NaN runs separately and retain NaN
-    separators; the output bound applies per run, with separators added.
     Inputs are converted to float64, including with ratio=1. Integers outside
     [-2**53, 2**53] may round, losing exact values and changing selected extrema
     relative to Python batch or streaming. For large integer timestamps,
@@ -117,8 +108,9 @@ def downsample(
     y : array-like
         The y-coordinates (e.g., values). Integer inputs are supported.
     ratio : int
-        The window size R, including NaNs. Must be >= 1. Output is bounded by
-        min(n, 2 * ceil(n / R) + 2), including global endpoints.
+        The window size R, counting only finite points. Must be >= 1.
+        Output is bounded by min(n, 2 * ceil(n / R) + 2), where n is the finite
+        point count.
 
     Returns
     -------
@@ -181,62 +173,59 @@ cdef inline Py_ssize_t _downsample_core_ptr(
     double* out_x,
     double* out_y,
 ) noexcept nogil:
-    """
-    Downsample fixed windows, ignoring NaNs unless the whole window is missing.
-    Handles ±Inf values as valid extrema in min/max comparison.
-    """
+    """Downsample the finite coordinate pairs without allocating a filtered copy."""
     cdef:
         Py_ssize_t min_idx = -1
         Py_ssize_t max_idx = -1
         Py_ssize_t potential_idx = -1
         Py_ssize_t last_retained = -1
+        Py_ssize_t last_valid = -1
         Py_ssize_t out_idx = 0
-        Py_ssize_t i, start, end
+        Py_ssize_t i
         double py
-        double min_y, max_y
+        double min_y = 0, max_y = 0
         int previous_min_flag = -1
-        bint has_valid
+        int counter = 0
 
-    _retain_index(x, y, 0, out_x, out_y, &out_idx, &last_retained)
-    start = 0
-    while start < n:
-        end = start + ratio
-        if end > n:
-            end = n
-        has_valid = False
-        for i in range(start, end):
-            py = y[i]
-            if isnan(py):
-                continue
-            has_valid = True
-            if min_idx < 0:
-                min_idx = max_idx = i
-                min_y = max_y = py
-            elif py >= max_y:
-                max_idx = i
-                max_y = py
-            elif py < min_y:
-                min_idx = i
-                min_y = py
+    for i in range(n):
+        py = y[i]
+        if not (isfinite(x[i]) and isfinite(py)):
+            continue
+        if ratio == 1:
+            _retain_index(x, y, i, out_x, out_y, &out_idx, &last_retained)
+            continue
+        if last_valid < 0:
+            _retain_index(x, y, i, out_x, out_y, &out_idx, &last_retained)
+        last_valid = i
+        counter += 1
+        if min_idx < 0:
+            min_idx = max_idx = i
+            min_y = max_y = py
+        elif py >= max_y:
+            max_idx = i
+            max_y = py
+        elif py < min_y:
+            min_idx = i
+            min_y = py
 
-        if has_valid:
+        if counter == ratio:
             _process_window_state(
                 x, y, &min_idx, &max_idx, &potential_idx, &previous_min_flag,
                 out_x, out_y, &out_idx, &last_retained,
             )
             min_y = y[min_idx]
             max_y = y[max_idx]
-        else:
-            if potential_idx >= 0:
-                _retain_index(x, y, potential_idx, out_x, out_y, &out_idx, &last_retained)
-            _retain_index(x, y, start, out_x, out_y, &out_idx, &last_retained)
-            min_idx = max_idx = potential_idx = -1
-            previous_min_flag = -1
-        start = end
+            counter = 0
 
+    if counter > 0:
+        _process_window_state(
+            x, y, &min_idx, &max_idx, &potential_idx, &previous_min_flag,
+            out_x, out_y, &out_idx, &last_retained,
+        )
     if potential_idx >= 0:
         _retain_index(x, y, potential_idx, out_x, out_y, &out_idx, &last_retained)
-    _retain_index(x, y, n - 1, out_x, out_y, &out_idx, &last_retained)
+    if last_valid >= 0:
+        _retain_index(x, y, last_valid, out_x, out_y, &out_idx, &last_retained)
 
     return out_idx
 
@@ -266,7 +255,7 @@ def downsample_into(
     is always sufficient. Smaller buffers must cover
     min(len(x), 2 * ceil(len(x) / ratio) + 2). With ratio=1, len(x) is required.
     The written prefix matches downsample(x, y, ratio).
-    The same gap visibility and float64 integer precision limits apply.
+    Non-finite pairs are discarded. The same float64 integer precision limits apply.
 
     Parameters
     ----------
@@ -309,11 +298,6 @@ def downsample_into(
     if out_x.shape[0] < max_output or out_y.shape[0] < max_output:
         raise ValueError(f"Output buffers too small. Need at least {max_output} elements.")
 
-    if ratio == 1:
-        memcpy(&out_x[0], &x_view[0], n * sizeof(double))
-        memcpy(&out_y[0], &y_view[0], n * sizeof(double))
-        return n
-
     cdef const double* x_ptr = &x_view[0]
     cdef const double* y_ptr = &y_view[0]
     cdef double* ox_ptr = &out_x[0]
@@ -340,7 +324,7 @@ def downsample_batch(
 
     More efficient than calling downsample() in a loop due to reduced
     Python overhead.
-    Each series follows downsample(), including its gap visibility and
+    Each series follows downsample(), including finite-only sampling and
     float64 integer precision limits.
 
     Parameters

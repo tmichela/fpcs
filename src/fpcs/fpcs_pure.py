@@ -8,7 +8,6 @@ This module provides two interfaces for the FPCS algorithm:
 
 from dataclasses import dataclass
 from typing import Iterator
-from math import isnan
 import numpy as np
 from numpy.typing import ArrayLike
 
@@ -29,19 +28,17 @@ class FPCSDownsampler:
 
     To match batch processing with the same input precision, flush only at the
     end. Each flush resets window and compensation state, so frequent flushing
-    changes compression and can change gap visibility. Integer comparisons are
+    changes compression. Integer comparisons are
     retained; Cython batch APIs convert inputs to float64 and can select different
     extrema for integers outside [-2**53, 2**53].
 
     Parameters
     ----------
     ratio : int
-        The window size R, counting all samples including NaNs. Must be >= 1.
-        Mixed windows ignore NaNs; all-NaN windows retain one gap marker.
-        Each flushed segment is bounded by min(n, 2 * ceil(n / R) + 2), including
-        endpoints, where n is its input length. Sum these bounds across segments.
-        An interior gap of up to 2 * R - 2 NaNs can disappear, depending on window
-        alignment; there is no elapsed-time limit on hidden gaps.
+        The window size R, counting only points with finite x and y. Must be >= 1.
+        Non-finite points are discarded, without gap markers. Each flushed
+        segment is bounded by min(n, 2 * ceil(n / R) + 2), including endpoints,
+        where n is its finite point count. Sum these bounds across segments.
 
     Example
     -------
@@ -69,7 +66,7 @@ class FPCSDownsampler:
         self._clear_window_state()
 
     def _clear_window_state(self):
-        """Clear extrema and compensation after a missing window or flush."""
+        """Clear extrema and compensation after a flush."""
         self._potential_point: Point | None = None
         self._potential_index: int = -1
         self._previous_min_flag: int = -1  # -1: no data, 0: retained max, 1: retained min
@@ -78,8 +75,6 @@ class FPCSDownsampler:
         self._max_index: int = -1
         self._min_point: Point | None = None
         self._min_index: int = -1
-        self._window_start_point: Point | None = None
-        self._window_has_valid: bool = False
 
     def _retain(self, index: int, point: Point) -> Iterator[tuple[float, float]]:
         """Yield each source point at most once, in input order."""
@@ -96,15 +91,18 @@ class FPCSDownsampler:
         x : float
             The x-coordinate (typically time/index).
         y : float
-            The y-coordinate (the value). NaNs count toward window length but
-            are ignored for extrema. All-NaN windows retain a gap marker.
-            ±Inf values are extrema. With ratio=1, every point is retained.
+            The y-coordinate (the value). Points with non-finite x or y are
+            discarded before window counting. With ratio=1, all finite points
+            are retained.
 
         Yields
         ------
         tuple[float, float]
             Retained points as (x, y) tuples.
         """
+        if not (np.isfinite(x) and np.isfinite(y)):
+            return
+
         index = self._index + 1
         self._index = index
         if self.ratio == 1:
@@ -115,21 +113,17 @@ class FPCSDownsampler:
         if self._last_point is None:
             yield from self._retain(index, p)
         self._last_point = p
-        if self._counter == 0:
-            self._window_start_point = p
         self._counter += 1
 
-        if not isnan(y):
-            self._window_has_valid = True
-            if self._max_point is None:
-                self._max_point = self._min_point = p
-                self._max_index = self._min_index = index
-            elif p.y >= self._max_point.y:
-                self._max_point = p
-                self._max_index = index
-            elif p.y < self._min_point.y:
-                self._min_point = p
-                self._min_index = index
+        if self._max_point is None:
+            self._max_point = self._min_point = p
+            self._max_index = self._min_index = index
+        elif p.y >= self._max_point.y:
+            self._max_point = p
+            self._max_index = index
+        elif p.y < self._min_point.y:
+            self._min_point = p
+            self._min_index = index
 
         # Check if we've reached the sampling threshold
         if self._counter >= self.ratio:
@@ -137,15 +131,6 @@ class FPCSDownsampler:
 
     def _process_window(self) -> Iterator[tuple[float, float]]:
         """Process the current window and yield retained points."""
-        if not self._window_has_valid:
-            if self._potential_point is not None:
-                yield from self._retain(self._potential_index, self._potential_point)
-            yield from self._retain(
-                self._index - self._counter + 1, self._window_start_point,
-            )
-            self._clear_window_state()
-            return
-
         if self._min_index < self._max_index:
             if self._previous_min_flag == 1 and self._potential_point is not None:
                 yield from self._retain(self._potential_index, self._potential_point)
@@ -166,8 +151,6 @@ class FPCSDownsampler:
             self._previous_min_flag = 0
 
         self._counter = 0
-        self._window_has_valid = False
-        self._window_start_point = None
 
     def flush(self) -> Iterator[tuple[float, float]]:
         """
@@ -177,7 +160,7 @@ class FPCSDownsampler:
         last endpoint. Repeated calls yield nothing until new points are added.
         New points start a fresh segment with reset windows and compensation;
         its output bound applies separately. Intermediate flushes change
-        compression and can change gap visibility.
+        compression.
 
         Yields
         ------
@@ -207,15 +190,12 @@ def downsample(
     """
     Downsample a time series using the FPCS algorithm.
 
-    Fixed windows count all input samples. Mixed windows ignore NaNs when
-    selecting extrema; all-NaN windows retain one gap marker and reset
-    compensation. Global endpoints are retained, even if NaN. With ratio=1,
-    all points are retained.
+    Points with non-finite x or y (NaN or either infinity) are discarded before
+    sampling. Windows count only finite points. The first and last finite points
+    of the series are retained. With ratio=1, all finite points are retained.
+    No gap markers are emitted; traces connect across discarded points. All-invalid input
+    produces empty arrays.
 
-    An interior gap of up to 2 * ratio - 2 NaNs can disappear, depending on
-    window alignment. Windows count samples, not elapsed time. To preserve
-    visible gaps, downsample contiguous non-NaN runs separately and retain NaN
-    separators; the output bound applies per run, with separators added.
     Integer comparisons are retained. Cython batch APIs convert inputs to
     float64, so exact values and selected extrema can differ for integers
     outside [-2**53, 2**53]. For large integer timestamps, subtract an integer
@@ -228,8 +208,9 @@ def downsample(
     y : array-like
         The y-coordinates (e.g., values).
     ratio : int
-        The window size R, including NaNs. Must be >= 1. Output is bounded by
-        min(n, 2 * ceil(n / R) + 2), including global endpoints.
+        The window size R, counting only finite points. Must be >= 1.
+        Output is bounded by min(n, 2 * ceil(n / R) + 2), where n is the finite
+        point count.
 
     Returns
     -------
@@ -258,12 +239,9 @@ def downsample(
     if len(x) == 0:
         return np.array([]), np.array([])
 
-    if len(x) == 1:
-        return x.copy(), y.copy()
-
-    # If ratio is 1, return a copy of the input
-    if ratio == 1:
-        return x.copy(), y.copy()
+    if len(x) == 1 or ratio == 1:
+        finite = np.isfinite(x) & np.isfinite(y)
+        return x[finite].copy(), y[finite].copy()
 
     downsampler = FPCSDownsampler(ratio)
 
